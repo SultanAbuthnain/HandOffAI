@@ -8,16 +8,16 @@ Zero external database servers. Zero build steps. Clone, add your API key, run o
 
 ## Key Features
 
-- **Zero External Dependencies:** Sessions, chat history, HITL state, documents, and L2-normalized `float32` vector embeddings all live inside a single local SQLite file (`app.db` with WAL mode).
-- **Provider-Agnostic AI Layer:** Switch seamlessly between **OpenAI** (`gpt-4o-mini` + `text-embedding-3-small`) and **Google Gemini** (`gemini-2.5-flash` + `gemini-embedding-001`) via `.env`.
-- **Strict Grounded RAG Pipeline:** Ingests plain text, Markdown, or `.txt`/`.md` files into ~500-character boundary-aware overlapping chunks. The AI answers **only** from retrieved context and outputs `[ESCALATE]` whenever confidence is low or information is missing.
+- **Zero External Dependencies:** Sessions, chat history, HITL state, documents, `FTS5` full-text index, and L2-normalized `float32` vector embeddings all live inside a single local SQLite file (`app.db` with WAL mode and persistent connections).
+- **Provider-Agnostic AI Layer & Streaming:** Switch seamlessly between **OpenAI** (`gpt-4o-mini` + `text-embedding-3-small`) and **Google Gemini** (`gemini-2.5-flash` + `gemini-embedding-001`) via `.env`, with real-time WebSocket token streaming.
+- **Hybrid Grounded RAG Pipeline (Vector + FTS5 RRF):** Ingests plain text or Markdown into ~500-character section-aware chunks and combines **NumPy cosine similarity** with **SQLite FTS5 BM25 keyword search** via Reciprocal Rank Fusion (RRF). Answers **only** from retrieved context and outputs `[ESCALATE]` whenever confidence is low or information is missing.
 - **Race-Condition-Proof HITL State Machine:**
   - Every session is strictly tracked in SQLite as `BOT_ACTIVE`, `WAITING_FOR_HUMAN`, or `HUMAN_ACTIVE`.
-  - **Auto-Escalation:** Triggered when a visitor requests a human, retrieval confidence is below threshold, or the LLM outputs `[ESCALATE]`. Alerts `/dashboard` in real time with a visual banner and chime.
-  - **Manual Takeover:** Agents can click **Take Over Chat** at any moment—immediately cancelling in-flight AI generation tasks and locking the session to `HUMAN_ACTIVE` until **Release to Bot** is clicked.
+  - **Auto-Escalation:** Triggered when a visitor requests a human, retrieval confidence is below threshold, or the LLM outputs `[ESCALATE]`. Alerts `/dashboard` in real time (plus optional Slack/Discord/JSON webhook via `ESCALATION_WEBHOOK_URL`) and offers optional visitor email capture.
+  - **Manual Takeover & AI Copilot:** Agents can click **Take Over Chat** at any moment—immediately aborting in-flight AI streams and locking the session to `HUMAN_ACTIVE`—and use **Suggest Reply** to draft grounded responses.
   - **Atomic Dispatch Guard:** Verifies `state == 'BOT_ACTIVE'` inside both a per-session asyncio lock and an atomic SQLite `BEGIN IMMEDIATE` transaction right before persisting and dispatching any AI reply.
-- **Shadow DOM Isolation:** Pure Vanilla JS (`widget.js`) isolated inside a Shadow Root so host website CSS never breaks the widget UI.
-- **Built-in Security:** `ALLOWED_ORIGINS` allowlist on CORS & WebSockets, sliding-window IP rate limiting, XSS-safe DOM rendering, and optional `AGENT_API_KEY` protection for `/dashboard` and Knowledge Base routes.
+- **Shadow DOM Isolation:** Pure Vanilla JS (`widget.js`, GZip + ETag cached) isolated inside a Shadow Root so host website CSS never breaks the widget UI.
+- **Built-in Security:** `ALLOWED_ORIGINS` allowlist on CORS & WebSockets, cryptographic `visitor_token` session protection against IDOR, sliding-window IP rate limiting, XSS-safe DOM rendering, and `AGENT_API_KEY` protection for `/dashboard` and Knowledge Base routes.
 
 ---
 
@@ -113,6 +113,7 @@ Add a single `<script>` tag before `</body>` on your site and whitelist your sit
 | `data-position` | `right` | Launcher placement: `right` or `left` |
 | `data-greeting` | *(built-in welcome)* | Initial greeting shown in new sessions |
 | `data-visitor-name` | `Visitor` | Optional display name for logged-in users |
+| `data-suggestions` | `Pricing plans\|Refund policy\|Talk to a human` | Pipe-separated starter prompt chips (`""` to hide) |
 | `data-server` | *(derived from script src)* | Optional override for backend base URL |
 
 ---
@@ -196,10 +197,11 @@ ai-support-hitl/
 - `POST /api/sessions/{session_id}/takeover` — Lock session to `HUMAN_ACTIVE` & cancel pending AI
 - `POST /api/sessions/{session_id}/release` — Return session to `BOT_ACTIVE`
 - `POST /api/sessions/{session_id}/messages` — Send an agent reply
+- `POST /api/sessions/{session_id}/suggest` — Generate a grounded AI Copilot draft reply for human agents
 - `DELETE /api/sessions/{session_id}` — Delete a session
 
 ### WebSocket Endpoints
-- `WS /ws/chat/{session_id}` — Visitor chat (`message`, `request_human`, `ping` → receives `session_init`, `message`, `state_change`, `typing`, `error`)
+- `WS /ws/chat/{session_id}` — Visitor chat (`message`, `request_human`, `set_email`, `ping` → receives `session_init`, `message_stream`, `message_stream_abort`, `message`, `state_change`, `typing`, `error`)
 - `WS /ws/agent` — Agent Dashboard (`take_over`, `release_to_bot`, `agent_message`, `typing`, `ping` → receives `dashboard_init`, `session_updated`, `message`, `state_change`, `escalation`, `presence`, `kb_updated`)
 
 ---

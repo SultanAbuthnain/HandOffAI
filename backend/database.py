@@ -10,8 +10,10 @@ enabled and atomic transactions for race-condition prevention.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
+import re
 import sqlite3
 import threading
 import uuid
@@ -51,6 +53,11 @@ def _normalize_vector(vec: np.ndarray | list[float]) -> np.ndarray:
     return np.ascontiguousarray(arr, dtype=np.float32)
 
 
+def _hash_token(token: str) -> str:
+    """Return a SHA-256 hex digest for storing visitor session tokens safely."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 class Database:
     """Thread-safe SQLite database manager for HITL sessions and RAG vectors."""
 
@@ -59,6 +66,10 @@ class Database:
         self.db_path = Path(resolved_path).expanduser().resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.RLock()
+        self._local = threading.local()
+        self._read_conns: list[sqlite3.Connection] = []
+        self._read_conns_lock = threading.Lock()
+        self._write_conn: Optional[sqlite3.Connection] = None
         self._vector_cache_lock = threading.RLock()
         self._vector_cache: dict[
             tuple[Optional[str], Optional[int]],
@@ -80,21 +91,56 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute("PRAGMA busy_timeout = 5000;")
+        conn.execute("PRAGMA mmap_size = 67108864;")
+        conn.execute("PRAGMA cache_size = -16000;")
         return conn
+
+    def _get_thread_read_conn(self) -> sqlite3.Connection:
+        conn: Optional[sqlite3.Connection] = getattr(self._local, "read_conn", None)
+        if conn is None:
+            conn = self._create_connection(autocommit=True)
+            self._local.read_conn = conn
+            with self._read_conns_lock:
+                self._read_conns.append(conn)
+        return conn
+
+    def _get_write_conn(self) -> sqlite3.Connection:
+        if self._write_conn is None:
+            self._write_conn = self._create_connection(autocommit=True)
+        return self._write_conn
+
+    def close(self) -> None:
+        """Close all persistent read/write SQLite connections cleanly."""
+        with self._write_lock:
+            if self._write_conn is not None:
+                try:
+                    self._write_conn.close()
+                except sqlite3.Error:
+                    pass
+                self._write_conn = None
+        with self._read_conns_lock:
+            for conn in self._read_conns:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self._read_conns.clear()
 
     @contextmanager
     def _read_conn(self) -> Iterator[sqlite3.Connection]:
-        conn = self._create_connection(autocommit=True)
+        conn = self._get_thread_read_conn()
         try:
             yield conn
-        finally:
-            conn.close()
+        except sqlite3.ProgrammingError:
+            self._local.read_conn = None
+            conn = self._get_thread_read_conn()
+            yield conn
 
     @contextmanager
     def _write_tx(self) -> Iterator[sqlite3.Connection]:
         """Acquire an exclusive SQLite write transaction (BEGIN IMMEDIATE)."""
         with self._write_lock:
-            conn = self._create_connection(autocommit=True)
+            conn = self._get_write_conn()
             try:
                 conn.execute("BEGIN IMMEDIATE;")
                 yield conn
@@ -105,84 +151,107 @@ class Database:
                 except sqlite3.Error:
                     pass
                 raise
-            finally:
-                conn.close()
 
     def init_db(self) -> None:
-        """Create schema and enable WAL mode for concurrent read/write safety."""
+        """Create schema, FTS5 index, and enable WAL mode for concurrent read/write safety."""
         with self._write_lock:
-            conn = self._create_connection(autocommit=True)
-            try:
-                conn.execute("PRAGMA journal_mode = WAL;")
-                conn.execute("PRAGMA synchronous = NORMAL;")
-                conn.executescript(
+            conn = self._get_write_conn()
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL DEFAULT 'BOT_ACTIVE'
+                        CHECK (state IN ('BOT_ACTIVE', 'WAITING_FOR_HUMAN', 'HUMAN_ACTIVE')),
+                    visitor_name TEXT NOT NULL DEFAULT 'Visitor',
+                    visitor_email TEXT,
+                    visitor_token_hash TEXT,
+                    origin TEXT,
+                    client_ip TEXT,
+                    assigned_agent TEXT,
+                    escalation_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_message_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    sender TEXT NOT NULL
+                        CHECK (sender IN ('user', 'bot', 'agent', 'system')),
+                    content TEXT NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS documents (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    source_type TEXT NOT NULL DEFAULT 'text',
+                    content_hash TEXT NOT NULL,
+                    chunk_count INTEGER NOT NULL DEFAULT 0,
+                    char_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    document_id TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    embedding_dim INTEGER NOT NULL,
+                    embedding_model TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+                );
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                    content,
+                    document_title,
+                    chunk_id UNINDEXED,
+                    document_id UNINDEXED
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_sessions_state_last_msg
+                    ON sessions(state, last_message_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_messages_session_id
+                    ON messages(session_id, id ASC);
+
+                CREATE INDEX IF NOT EXISTS idx_chunks_document_id
+                    ON chunks(document_id);
+
+                CREATE INDEX IF NOT EXISTS idx_chunks_model_dim
+                    ON chunks(embedding_model, embedding_dim);
+
+                CREATE INDEX IF NOT EXISTS idx_documents_content_hash
+                    ON documents(content_hash);
+                """
+            )
+            # Safe schema migration for existing databases created prior to visitor_token_hash
+            cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if "visitor_token_hash" not in cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN visitor_token_hash TEXT;")
+
+            # Backfill FTS5 index if chunks already exist from an earlier version
+            chunk_total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            fts_total = conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+            if chunk_total > 0 and fts_total == 0:
+                conn.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS sessions (
-                        id TEXT PRIMARY KEY,
-                        state TEXT NOT NULL DEFAULT 'BOT_ACTIVE'
-                            CHECK (state IN ('BOT_ACTIVE', 'WAITING_FOR_HUMAN', 'HUMAN_ACTIVE')),
-                        visitor_name TEXT NOT NULL DEFAULT 'Visitor',
-                        visitor_email TEXT,
-                        origin TEXT,
-                        client_ip TEXT,
-                        assigned_agent TEXT,
-                        escalation_reason TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        last_message_at TEXT NOT NULL
-                    );
-
-                    CREATE TABLE IF NOT EXISTS messages (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        session_id TEXT NOT NULL,
-                        sender TEXT NOT NULL
-                            CHECK (sender IN ('user', 'bot', 'agent', 'system')),
-                        content TEXT NOT NULL,
-                        metadata TEXT,
-                        created_at TEXT NOT NULL,
-                        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-                    );
-
-                    CREATE TABLE IF NOT EXISTS documents (
-                        id TEXT PRIMARY KEY,
-                        title TEXT NOT NULL,
-                        source_type TEXT NOT NULL DEFAULT 'text',
-                        content_hash TEXT NOT NULL,
-                        chunk_count INTEGER NOT NULL DEFAULT 0,
-                        char_count INTEGER NOT NULL DEFAULT 0,
-                        created_at TEXT NOT NULL
-                    );
-
-                    CREATE TABLE IF NOT EXISTS chunks (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        document_id TEXT NOT NULL,
-                        chunk_index INTEGER NOT NULL,
-                        content TEXT NOT NULL,
-                        embedding BLOB NOT NULL,
-                        embedding_dim INTEGER NOT NULL,
-                        embedding_model TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
-                    );
-
-                    CREATE INDEX IF NOT EXISTS idx_sessions_state_last_msg
-                        ON sessions(state, last_message_at DESC);
-
-                    CREATE INDEX IF NOT EXISTS idx_messages_session_id
-                        ON messages(session_id, id ASC);
-
-                    CREATE INDEX IF NOT EXISTS idx_chunks_document_id
-                        ON chunks(document_id);
-
-                    CREATE INDEX IF NOT EXISTS idx_chunks_model_dim
-                        ON chunks(embedding_model, embedding_dim);
-
-                    CREATE INDEX IF NOT EXISTS idx_documents_content_hash
-                        ON documents(content_hash);
+                    INSERT INTO chunks_fts (content, document_title, chunk_id, document_id)
+                    SELECT c.content, d.title, c.id, c.document_id
+                    FROM chunks c
+                    INNER JOIN documents d ON d.id = c.document_id
                     """
                 )
-            finally:
-                conn.close()
 
     # ------------------------------------------------------------------
     # Row Serialization Helpers
@@ -191,6 +260,7 @@ class Database:
     @staticmethod
     def _row_to_session(row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)
+        data.pop("visitor_token_hash", None)
         return data
 
     @staticmethod
@@ -290,10 +360,12 @@ class Database:
         visitor_email: Optional[str] = None,
         origin: Optional[str] = None,
         client_ip: Optional[str] = None,
+        visitor_token: Optional[str] = None,
     ) -> dict[str, Any]:
         sid = (session_id or "").strip() or str(uuid.uuid4())
         now = _utc_now_iso()
         clean_name = (visitor_name or "Visitor").strip()[:80] or "Visitor"
+        token_hash = _hash_token(visitor_token) if visitor_token else None
 
         with self._write_tx() as conn:
             existing = conn.execute(
@@ -322,16 +394,18 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO sessions (
-                    id, state, visitor_name, visitor_email, origin, client_ip,
-                    assigned_agent, escalation_reason, created_at, updated_at, last_message_at
+                    id, state, visitor_name, visitor_email, visitor_token_hash,
+                    origin, client_ip, assigned_agent, escalation_reason,
+                    created_at, updated_at, last_message_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
                 """,
                 (
                     sid,
                     SessionState.BOT_ACTIVE.value,
                     clean_name,
                     visitor_email,
+                    token_hash,
                     origin,
                     client_ip,
                     now,
@@ -341,6 +415,39 @@ class Database:
             )
             row = conn.execute("SELECT * FROM sessions WHERE id = ?", (sid,)).fetchone()
             return self._row_to_session(row)
+
+    def verify_visitor_token(self, session_id: str, visitor_token: Optional[str]) -> bool:
+        """
+        Verify a visitor's session token against the stored hash.
+        Legacy sessions without a stored `visitor_token_hash` remain accessible.
+        """
+        with self._read_conn() as conn:
+            row = conn.execute(
+                "SELECT visitor_token_hash FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return True
+        stored_hash = row["visitor_token_hash"]
+        if not stored_hash:
+            return True
+        if not visitor_token:
+            return False
+        return hmac.compare_digest(stored_hash, _hash_token(visitor_token))
+
+    def update_visitor_email(self, session_id: str, email: str) -> Optional[dict[str, Any]]:
+        clean_email = (email or "").strip()[:120]
+        if not clean_email:
+            return None
+        now = _utc_now_iso()
+        with self._write_tx() as conn:
+            cursor = conn.execute(
+                "UPDATE sessions SET visitor_email = ?, updated_at = ? WHERE id = ?",
+                (clean_email, now, session_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_session(session_id)
 
     def get_session_state(self, session_id: str) -> Optional[SessionState]:
         """Fast state lookup used right before dispatching AI responses."""
@@ -688,6 +795,7 @@ class Database:
                 (content_hash, embedding_model),
             ).fetchall()
             for old_doc in existing_docs:
+                conn.execute("DELETE FROM chunks_fts WHERE document_id = ?", (old_doc["id"],))
                 conn.execute("DELETE FROM documents WHERE id = ?", (old_doc["id"],))
 
             conn.execute(
@@ -730,6 +838,18 @@ class Database:
                 ],
             )
 
+            inserted_chunks = conn.execute(
+                "SELECT id, content FROM chunks WHERE document_id = ? ORDER BY chunk_index ASC",
+                (doc_id,),
+            ).fetchall()
+            conn.executemany(
+                "INSERT INTO chunks_fts (content, document_title, chunk_id, document_id) VALUES (?, ?, ?, ?)",
+                [
+                    (c_row["content"], clean_title, c_row["id"], doc_id)
+                    for c_row in inserted_chunks
+                ],
+            )
+
             row = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
             self._invalidate_vector_cache()
             return dict(row)
@@ -762,11 +882,58 @@ class Database:
 
     def delete_document(self, document_id: str) -> bool:
         with self._write_tx() as conn:
+            conn.execute("DELETE FROM chunks_fts WHERE document_id = ?", (document_id,))
             cursor = conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
             deleted = cursor.rowcount > 0
             if deleted:
                 self._invalidate_vector_cache()
             return deleted
+
+    def search_chunks_fts(self, query: str, limit: int = 12) -> list[dict[str, Any]]:
+        """
+        Perform BM25 keyword search over `chunks_fts` using SQLite FTS5.
+        Returns ranked chunk metadata dicts (lower BM25 value = stronger match).
+        """
+        tokens = [
+            tok
+            for tok in re.findall(r"[A-Za-z0-9_]{2,}", query or "")
+            if tok.lower() not in {"the", "and", "for", "with", "that", "this", "what", "how", "are", "you", "your", "can"}
+        ]
+        if not tokens:
+            return []
+
+        fts_expr = " OR ".join(f'"{tok}"' for tok in tokens[:12])
+        safe_limit = max(1, min(limit, 50))
+        with self._read_conn() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        chunk_id,
+                        document_id,
+                        document_title,
+                        content,
+                        bm25(chunks_fts) AS rank
+                    FROM chunks_fts
+                    WHERE chunks_fts MATCH ?
+                    ORDER BY rank ASC
+                    LIMIT ?
+                    """,
+                    (fts_expr, safe_limit),
+                ).fetchall()
+            except sqlite3.Error:
+                return []
+
+        return [
+            {
+                "chunk_id": int(r["chunk_id"]),
+                "document_id": r["document_id"],
+                "document_title": r["document_title"],
+                "content": r["content"],
+                "fts_rank": float(r["rank"]),
+            }
+            for r in rows
+        ]
 
     def get_all_chunks_for_search(
         self,

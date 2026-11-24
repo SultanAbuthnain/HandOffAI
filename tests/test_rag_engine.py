@@ -168,3 +168,55 @@ async def test_end_to_end_rag_ingest_retrieve_and_generate_reply(
     res_low = await engine.generate_reply("Do you offer on-premise mainframe deployment?")
     assert res_low.should_escalate is True
     assert "low confidence" in (res_low.escalation_reason or "").lower()
+
+
+def test_chunk_text_injects_markdown_section_headers() -> None:
+    md = (
+        "## Refund Policy\n"
+        + ("New customers receive a 30-day money-back guarantee. " * 6)
+        + "\n\n"
+        + ("Prorated credits are issued automatically on mid-cycle downgrades. " * 4)
+    )
+    chunks = chunk_text(md, chunk_size=220, chunk_overlap=30)
+    assert len(chunks) >= 2
+    assert any(c.startswith("[Section: Refund Policy]") for c in chunks[1:])
+
+
+@pytest.mark.asyncio()
+async def test_generate_reply_stream_and_agent_copilot_suggest(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = RAGEngine(db=db, provider="openai", api_key="sk-test-key", min_similarity=0.5)
+
+    async def fake_embed_texts(texts: list[str]) -> list[np.ndarray]:
+        return [np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32) for _ in texts]
+
+    async def fake_stream_openai(system_prompt, history, user_prompt, on_chunk):
+        for piece in ["We offer ", "a 30-day ", "money-back guarantee."]:
+            await on_chunk(piece)
+        return "We offer a 30-day money-back guarantee."
+
+    async def fake_call_openai(system_prompt, history, user_prompt):
+        return "Hi there, we offer a 30-day money-back guarantee on all plans."
+
+    monkeypatch.setattr(engine, "embed_texts", fake_embed_texts)
+    monkeypatch.setattr(engine, "_stream_openai_chat", fake_stream_openai)
+    monkeypatch.setattr(engine, "_call_openai_chat", fake_call_openai)
+
+    await engine.ingest_text("Refunds", "30-day money-back guarantee.", source_type="markdown")
+
+    streamed_deltas: list[str] = []
+
+    async def collect_delta(delta: str) -> None:
+        streamed_deltas.append(delta)
+
+    res = await engine.generate_reply_stream("What is the refund policy?", on_delta=collect_delta)
+    assert res.should_escalate is False
+    assert "".join(streamed_deltas) == "We offer a 30-day money-back guarantee."
+
+    suggestion = await engine.suggest_agent_reply(
+        [{"role": "user", "content": "What is your refund policy?"}]
+    )
+    assert "30-day money-back guarantee" in suggestion["draft"]
+    assert suggestion["confidence"] >= 0.99

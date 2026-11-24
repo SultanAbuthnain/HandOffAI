@@ -164,9 +164,18 @@
     <main x-show="activeTab === 'inbox'" class="flex-1 flex min-h-0 overflow-hidden">
 
       <!-- Left Sidebar: Session Queue -->
-      <aside class="w-80 lg:w-96 bg-white border-r border-slate-200 flex flex-col min-h-0 flex-shrink-0">
-        <!-- State Filters -->
+      <aside
+        class="w-full md:w-80 lg:w-96 bg-white border-r border-slate-200 flex-col min-h-0 flex-shrink-0"
+        :class="mobileShowChat && selectedSession ? 'hidden md:flex' : 'flex'"
+      >
+        <!-- State Filters & Search -->
         <div class="p-3 border-b border-slate-200 space-y-2.5">
+          <input
+            type="search"
+            x-model="inboxSearch"
+            placeholder="Search visitor, email, or message..."
+            class="w-full px-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50 text-xs text-slate-800 focus:bg-white focus:outline-none focus:border-blue-500"
+          />
           <div class="grid grid-cols-4 gap-1 bg-slate-100 p-1 rounded-xl text-[11px] font-semibold">
             <button
               @click="stateFilter = 'ALL'"
@@ -259,7 +268,10 @@
       </aside>
 
       <!-- Right Main Area: Selected Conversation -->
-      <section class="flex-1 flex flex-col min-w-0 min-h-0 bg-slate-50">
+      <section
+        class="flex-1 flex-col min-w-0 min-h-0 bg-slate-50"
+        :class="mobileShowChat && selectedSession ? 'flex' : 'hidden md:flex'"
+      >
         <template x-if="!selectedSession">
           <div class="flex-1 flex items-center justify-center p-8 text-center">
             <div class="max-w-md">
@@ -282,6 +294,13 @@
             <div class="bg-white border-b border-slate-200 px-5 py-3.5 flex flex-wrap items-center justify-between gap-3 flex-shrink-0">
               <div class="min-w-0">
                 <div class="flex items-center gap-2.5">
+                  <button
+                    type="button"
+                    @click="mobileShowChat = false"
+                    class="md:hidden px-2 py-1 rounded-lg border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                  >
+                    Back
+                  </button>
                   <h2 class="font-bold text-slate-900 text-base truncate" x-text="selectedSession.visitor_name || 'Visitor'"></h2>
                   <span
                     class="text-xs font-bold px-2.5 py-0.5 rounded-full"
@@ -296,6 +315,7 @@
                 </div>
                 <div class="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-2">
                   <span class="font-mono" x-text="'Session: ' + selectedSession.id.slice(0, 12)"></span>
+                  <span x-show="selectedSession.visitor_email" class="text-blue-700 font-medium" x-text="'· ' + selectedSession.visitor_email"></span>
                   <span x-show="selectedSession.origin" x-text="'· Origin: ' + selectedSession.origin"></span>
                   <span x-show="selectedSession.assigned_agent" x-text="'· Assigned: ' + selectedSession.assigned_agent"></span>
                 </div>
@@ -316,6 +336,14 @@
                   class="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs sm:text-sm font-semibold shadow-sm transition"
                 >
                   Release to Bot
+                </button>
+                <button
+                  type="button"
+                  @click="exportTranscript(selectedSession.id)"
+                  class="px-3 py-2 rounded-xl border border-slate-200 hover:bg-slate-100 text-slate-700 text-xs font-semibold transition"
+                  title="Export conversation transcript as JSON"
+                >
+                  Export
                 </button>
                 <button
                   @click="deleteSession(selectedSession.id)"
@@ -419,6 +447,14 @@
                     : 'Type a reply to automatically Take Over and respond as ' + agentName + '...'"
                   class="flex-1 resize-none rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
                 ></textarea>
+                <button
+                  type="button"
+                  @click="suggestReply()"
+                  :disabled="suggestBusy || !aiInfo.configured"
+                  class="px-3.5 py-2.5 h-[44px] rounded-xl border border-slate-300 bg-slate-50 hover:bg-slate-100 disabled:opacity-40 text-slate-700 font-semibold text-xs transition flex-shrink-0"
+                  title="Draft a grounded reply using Knowledge Base RAG"
+                  x-text="suggestBusy ? 'Drafting...' : 'Suggest Reply'"
+                ></button>
                 <button
                   type="submit"
                   :disabled="!replyText.trim()"
@@ -655,9 +691,12 @@
         // Sessions & Messages
         sessions: [],
         selectedSessionId: null,
+        mobileShowChat: false,
+        inboxSearch: "",
         messagesBySession: {},
         botTypingSessions: {},
         replyText: "",
+        suggestBusy: false,
         typingTimer: null,
 
         // Knowledge Base UI state
@@ -690,10 +729,24 @@
         },
 
         get filteredSessions() {
-          const list =
+          const q = (this.inboxSearch || "").trim().toLowerCase();
+          let list =
             this.stateFilter === "ALL"
               ? [...this.sessions]
               : this.sessions.filter((s) => s.state === this.stateFilter);
+          if (q) {
+            list = list.filter((s) => {
+              const hay = [
+                s.visitor_name || "",
+                s.visitor_email || "",
+                s.id || "",
+                s.last_message_preview || "",
+              ]
+                .join(" ")
+                .toLowerCase();
+              return hay.includes(q);
+            });
+          }
           const priority = { WAITING_FOR_HUMAN: 0, HUMAN_ACTIVE: 1, BOT_ACTIVE: 2 };
           return list.sort((a, b) => {
             const pDiff = (priority[a.state] ?? 3) - (priority[b.state] ?? 3);
@@ -896,6 +949,7 @@
 
         async selectSession(sessionId) {
           this.selectedSessionId = sessionId;
+          this.mobileShowChat = true;
           try {
             const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
               headers: this.authHeaders(),
@@ -987,8 +1041,51 @@
             headers: this.authHeaders(),
           });
           if (res.ok) {
+            this.mobileShowChat = false;
             this.addToast("info", "Deleted", "Conversation removed.");
           }
+        },
+
+        async suggestReply() {
+          if (!this.selectedSessionId || this.suggestBusy) return;
+          this.suggestBusy = true;
+          try {
+            const res = await fetch(`/api/sessions/${encodeURIComponent(this.selectedSessionId)}/suggest`, {
+              method: "POST",
+              headers: this.authHeaders(),
+            });
+            const data = await res.json();
+            if (!res.ok) {
+              this.addToast("error", "Draft Failed", data.detail || "Could not generate suggestion.");
+              return;
+            }
+            if (data.draft) {
+              this.replyText = data.draft;
+            }
+          } catch (_err) {
+            this.addToast("error", "Draft Failed", "Network error while generating suggestion.");
+          } finally {
+            this.suggestBusy = false;
+          }
+        },
+
+        exportTranscript(sessionId) {
+          const sess = this.sessions.find((s) => s.id === sessionId);
+          const msgs = this.messagesBySession[sessionId] || [];
+          const payload = {
+            exported_at: new Date().toISOString(),
+            session: sess || { id: sessionId },
+            messages: msgs,
+          };
+          const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `chat-${sessionId.slice(0, 8)}.json`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
         },
 
         // -----------------------------------------------------------------

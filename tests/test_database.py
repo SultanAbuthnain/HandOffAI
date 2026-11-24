@@ -147,3 +147,34 @@ def test_vector_normalization_deduplication_and_cache_invalidation(db: Database)
     meta_after, matrix_after = db.get_all_chunks_for_search("test-embed-v1", 4)
     assert meta_after == []
     assert matrix_after.size == 0
+
+
+def test_fts5_search_visitor_token_and_email_persistence(db: Database) -> None:
+    v1 = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    doc = db.create_document_with_chunks(
+        title="API Errors",
+        source_type="markdown",
+        raw_content="HTTP 429 Too Many Requests returns Retry-After header.",
+        chunk_texts=["HTTP 429 Too Many Requests returns Retry-After header."],
+        embeddings=[v1],
+        embedding_model="test-embed-v1",
+    )
+    fts_hits = db.search_chunks_fts("429 Retry-After")
+    assert len(fts_hits) == 1
+    assert fts_hits[0]["document_id"] == doc["id"]
+
+    # Visitor token verification & email update
+    sess = db.get_or_create_session(
+        session_id="sess-tok-1",
+        visitor_name="Eve",
+        visitor_token="secret-tok-123",
+    )
+    assert "visitor_token_hash" not in sess
+    assert db.verify_visitor_token("sess-tok-1", "secret-tok-123") is True
+    assert db.verify_visitor_token("sess-tok-1", "wrong-tok") is False
+    assert db.verify_visitor_token("sess-tok-1", None) is False
+
+    updated = db.update_visitor_email("sess-tok-1", "eve@example.com")
+    assert updated is not None
+    assert updated["visitor_email"] == "eve@example.com"
+    db.close()

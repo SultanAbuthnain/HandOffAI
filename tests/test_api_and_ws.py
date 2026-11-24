@@ -35,8 +35,14 @@ def app_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     async def fake_openai_chat(system_prompt: str, history: list[dict[str, str]], user_prompt: str) -> str:
         return "Grounded response from test knowledge base."
 
+    async def fake_stream_openai_chat(system_prompt, history, user_prompt, on_chunk) -> str:
+        text = "Grounded response from test knowledge base."
+        await on_chunk(text)
+        return text
+
     monkeypatch.setattr(test_rag, "embed_texts", fake_embed_texts)
     monkeypatch.setattr(test_rag, "_call_openai_chat", fake_openai_chat)
+    monkeypatch.setattr(test_rag, "_stream_openai_chat", fake_stream_openai_chat)
 
     limiter = IPRateLimiter(max_requests=5, window_seconds=60)
     manager = ConnectionManager(db=test_db, rag=test_rag, rate_limiter=limiter)
@@ -218,3 +224,55 @@ def test_websocket_hitl_escalation_takeover_and_release(app_client: TestClient) 
             v_rel_events = [ws_visitor.receive_json() for _ in range(2)]
             rel_state_evt = next(e for e in v_rel_events if e["type"] == "state_change")
             assert rel_state_evt["session"]["state"] == SessionState.BOT_ACTIVE.value
+
+
+def test_visitor_token_idor_protection_email_capture_and_suggest_endpoint(
+    app_client: TestClient,
+) -> None:
+    # 1. Create session with a visitor_token
+    with app_client.websocket_connect(
+        "/ws/chat/secure-sess-1?visitor_name=Grace&visitor_token=tok-abc-123"
+    ) as ws:
+        init_msg = ws.receive_json()
+        assert init_msg["type"] == "session_init"
+
+        # Capture visitor email over WebSocket
+        ws.send_json({"type": "set_email", "email": "grace@example.com"})
+        state_evt = ws.receive_json()
+        assert state_evt["type"] == "state_change"
+        assert state_evt["session"]["visitor_email"] == "grace@example.com"
+
+        # Add a user turn and drain the bot reply so no background AI task races reconnects
+        ws.send_json({"type": "message", "content": "Hello!"})
+        seen_bot_done = False
+        for _ in range(6):
+            evt = ws.receive_json()
+            if evt.get("type") == "typing" and evt.get("is_typing") is False:
+                seen_bot_done = True
+                break
+        assert seen_bot_done is True
+
+    # 2. Reconnecting without or with wrong visitor_token must fail with 1008
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with app_client.websocket_connect("/ws/chat/secure-sess-1?visitor_token=wrong-tok") as ws_bad:
+            ws_bad.receive_json()
+    assert exc_info.value.code == 1008
+
+    # 3. Reconnecting with valid visitor_token succeeds
+    with app_client.websocket_connect(
+        "/ws/chat/secure-sess-1?visitor_token=tok-abc-123"
+    ) as ws_ok:
+        assert ws_ok.receive_json()["type"] == "session_init"
+
+    # 4. Suggest Reply copilot endpoint returns a draft
+    res_suggest = app_client.post("/api/sessions/secure-sess-1/suggest")
+    assert res_suggest.status_code == 200
+    assert "draft" in res_suggest.json()
+
+    # 5. /widget.js supports ETag 304 Not Modified
+    r1 = app_client.get("/widget.js")
+    assert r1.status_code == 200
+    etag = r1.headers.get("etag")
+    assert etag
+    r2 = app_client.get("/widget.js", headers={"If-None-Match": etag})
+    assert r2.status_code == 304

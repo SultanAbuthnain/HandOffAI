@@ -71,9 +71,18 @@
       "Hi! Ask me anything about our documentation, or click 'Human' anytime to reach our team.",
     visitorName:
       (currentScript && currentScript.getAttribute("data-visitor-name")) || "Visitor",
+    suggestions: (function () {
+      const raw = currentScript && currentScript.getAttribute("data-suggestions");
+      if (raw === "") return [];
+      if (raw) {
+        return raw.split("|").map((s) => s.trim()).filter(Boolean).slice(0, 4);
+      }
+      return ["Pricing plans", "Refund policy", "Talk to a human"];
+    })(),
   };
 
   const STORAGE_KEY_SESSION = "ai_support_hitl_session_id";
+  const STORAGE_KEY_TOKEN = "ai_support_hitl_visitor_token";
   const STORAGE_KEY_OPEN = "ai_support_hitl_open";
   const STORAGE_KEY_ACTIVE = "ai_support_hitl_active";
 
@@ -109,10 +118,34 @@
     }
   }
 
-  function buildWebSocketUrl(sessionId) {
+  function getOrCreateVisitorToken() {
+    try {
+      let tok = window.localStorage.getItem(STORAGE_KEY_TOKEN);
+      if (!tok) {
+        tok = generateUUID();
+        window.localStorage.setItem(STORAGE_KEY_TOKEN, tok);
+      }
+      return tok;
+    } catch (_err) {
+      return generateUUID();
+    }
+  }
+
+  function setStoredVisitorToken(tok) {
+    try {
+      window.localStorage.setItem(STORAGE_KEY_TOKEN, tok);
+    } catch (_err) {
+      // Ignore storage restrictions
+    }
+  }
+
+  function buildWebSocketUrl(sessionId, visitorToken) {
     const httpUrl = new URL(CONFIG.serverBase);
     const wsProtocol = httpUrl.protocol === "https:" ? "wss:" : "ws:";
-    const params = new URLSearchParams({ visitor_name: CONFIG.visitorName });
+    const params = new URLSearchParams({
+      visitor_name: CONFIG.visitorName,
+      visitor_token: visitorToken,
+    });
     return `${wsProtocol}//${httpUrl.host}/ws/chat/${encodeURIComponent(sessionId)}?${params.toString()}`;
   }
 
@@ -121,12 +154,15 @@
   // ---------------------------------------------------------------------------
   const state = {
     sessionId: getOrCreateSessionId(),
+    visitorToken: getOrCreateVisitorToken(),
+    visitorEmail: null,
     isOpen: false,
     connected: false,
     sessionState: "BOT_ACTIVE", // BOT_ACTIVE | WAITING_FOR_HUMAN | HUMAN_ACTIVE
     assignedAgent: null,
     messages: [],
     messageIds: new Set(),
+    streamBubbles: new Map(),
     unreadCount: 0,
     typing: { active: false, label: "" },
     ws: null,
@@ -479,6 +515,102 @@
       text-decoration: underline;
     }
 
+    .bubble strong {
+      font-weight: 700;
+    }
+
+    .bubble code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      background: rgba(15, 23, 42, 0.08);
+      padding: 1px 5px;
+      border-radius: 5px;
+    }
+
+    .msg-row.user .bubble code {
+      background: rgba(255, 255, 255, 0.22);
+    }
+
+    .md-li {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      margin-top: 3px;
+    }
+
+    .md-li-dot {
+      flex-shrink: 0;
+      font-weight: 700;
+    }
+
+    .suggestions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 6px;
+    }
+
+    .suggestion-chip {
+      border: 1px solid #cbd5e1;
+      background: #ffffff;
+      color: #1e293b;
+      font-size: 12px;
+      font-weight: 500;
+      padding: 5px 10px;
+      border-radius: 9999px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .suggestion-chip:hover {
+      border-color: ${CONFIG.primaryColor};
+      color: ${CONFIG.primaryColor};
+      background: #f8fafc;
+    }
+
+    .email-bar {
+      display: none;
+      background: #fffbeb;
+      border-top: 1px solid #fde68a;
+      padding: 8px 12px;
+      gap: 6px;
+      align-items: center;
+      flex-shrink: 0;
+    }
+
+    .email-bar.visible {
+      display: flex;
+    }
+
+    .email-bar input {
+      flex: 1;
+      min-width: 0;
+      border: 1px solid #fcd34d;
+      border-radius: 8px;
+      padding: 6px 9px;
+      font-size: 12px;
+      font-family: inherit;
+      background: #ffffff;
+      color: #0f172a;
+      outline: none;
+    }
+
+    .email-bar button {
+      border: none;
+      background: #d97706;
+      color: #ffffff;
+      font-size: 11.5px;
+      font-weight: 600;
+      padding: 6px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .email-bar button:hover {
+      background: #b45309;
+    }
+
     .typing-row {
       display: none;
       align-items: center;
@@ -667,6 +799,18 @@
   const typingLabel = document.createElement("span");
   typingRow.appendChild(typingLabel);
 
+  // Email Follow-Up Capture Bar (shown when waiting for human & email not set)
+  const emailBar = document.createElement("form");
+  emailBar.className = "email-bar";
+  const emailInput = document.createElement("input");
+  emailInput.type = "email";
+  emailInput.placeholder = "Optional: leave email for follow-up...";
+  emailInput.setAttribute("aria-label", "Email for follow-up");
+  const emailSubmitBtn = document.createElement("button");
+  emailSubmitBtn.type = "submit";
+  emailSubmitBtn.textContent = "Save";
+  emailBar.append(emailInput, emailSubmitBtn);
+
   // Composer
   const composer = document.createElement("form");
   composer.className = "composer";
@@ -685,7 +829,7 @@
     '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>';
 
   composer.append(inputEl, sendBtn);
-  panel.append(header, statusBar, errorBanner, messagesEl, typingRow, composer);
+  panel.append(header, statusBar, errorBanner, messagesEl, typingRow, emailBar, composer);
 
   // Floating Launcher Button
   const launcher = document.createElement("button");
@@ -705,9 +849,9 @@
   // ---------------------------------------------------------------------------
   // Rendering Helpers (XSS-safe: never injects raw HTML for message content)
   // ---------------------------------------------------------------------------
-  function appendTextWithSafeLinks(parent, text) {
-    const urlRegex = /(https?:\/\/[^\s<]+)/g;
-    const parts = String(text || "").split(urlRegex);
+  function appendInlineSegments(parent, text) {
+    const tokenRegex = /(https?:\/\/[^\s<]+|`[^`]+`|\*\*[^*]+\*\*)/g;
+    const parts = String(text || "").split(tokenRegex);
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i];
       if (!part) continue;
@@ -723,8 +867,41 @@
         if (trailing) {
           parent.appendChild(document.createTextNode(trailing));
         }
+      } else if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
+        const code = document.createElement("code");
+        code.textContent = part.slice(1, -1);
+        parent.appendChild(code);
+      } else if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+        const strong = document.createElement("strong");
+        strong.textContent = part.slice(2, -2);
+        parent.appendChild(strong);
       } else {
         parent.appendChild(document.createTextNode(part));
+      }
+    }
+  }
+
+  function renderFormattedMessage(parent, text) {
+    parent.textContent = "";
+    const lines = String(text || "").split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const bulletMatch = line.match(/^\s*[-*]\s+(.+)$/);
+      if (bulletMatch) {
+        const li = document.createElement("div");
+        li.className = "md-li";
+        const dot = document.createElement("span");
+        dot.className = "md-li-dot";
+        dot.textContent = "•";
+        const body = document.createElement("span");
+        appendInlineSegments(body, bulletMatch[1]);
+        li.append(dot, body);
+        parent.appendChild(li);
+      } else {
+        if (i > 0 && !lines[i - 1].match(/^\s*[-*]\s+/)) {
+          parent.appendChild(document.createTextNode("\n"));
+        }
+        appendInlineSegments(parent, line);
       }
     }
   }
@@ -740,6 +917,10 @@
   }
 
   function renderStatus() {
+    const showEmailBar =
+      state.connected && state.sessionState === "WAITING_FOR_HUMAN" && !state.visitorEmail;
+    emailBar.classList.toggle("visible", showEmailBar);
+
     if (!state.connected) {
       statusPill.className = "status-pill offline";
       statusText.textContent = "Reconnecting...";
@@ -810,7 +991,7 @@
 
     const bubble = document.createElement("div");
     bubble.className = "bubble";
-    appendTextWithSafeLinks(bubble, msg.content);
+    renderFormattedMessage(bubble, msg.content);
     row.appendChild(bubble);
     return row;
   }
@@ -821,6 +1002,7 @@
 
   function renderAllMessages() {
     messagesEl.innerHTML = "";
+    state.streamBubbles.clear();
     if (state.messages.length === 0) {
       messagesEl.appendChild(
         createMessageNode({
@@ -829,6 +1011,23 @@
           created_at: null,
         })
       );
+      if (CONFIG.suggestions.length > 0) {
+        const chipsWrap = document.createElement("div");
+        chipsWrap.className = "suggestions";
+        for (const label of CONFIG.suggestions) {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "suggestion-chip";
+          chip.textContent = label;
+          chip.addEventListener("click", () => {
+            if (sendJson({ type: "message", content: label })) {
+              chipsWrap.remove();
+            }
+          });
+          chipsWrap.appendChild(chip);
+        }
+        messagesEl.appendChild(chipsWrap);
+      }
     } else {
       for (const msg of state.messages) {
         messagesEl.appendChild(createMessageNode(msg));
@@ -837,9 +1036,63 @@
     scrollToBottom();
   }
 
-  function appendMessage(msg) {
+  function handleStreamDelta(streamId, delta) {
+    if (!streamId || !delta) return;
+    let entry = state.streamBubbles.get(streamId);
+    if (!entry) {
+      if (state.messages.length === 0) {
+        messagesEl.innerHTML = "";
+        messagesEl.appendChild(
+          createMessageNode({
+            sender: "bot",
+            content: CONFIG.greeting,
+            created_at: null,
+          })
+        );
+      }
+      const row = document.createElement("div");
+      row.className = "msg-row bot";
+      const meta = document.createElement("div");
+      meta.className = "msg-meta";
+      meta.textContent = "AI Assistant";
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      row.append(meta, bubble);
+      messagesEl.appendChild(row);
+      entry = { row, meta, bubble, text: "" };
+      state.streamBubbles.set(streamId, entry);
+    }
+    entry.text += delta;
+    renderFormattedMessage(entry.bubble, entry.text);
+    scrollToBottom();
+  }
+
+  function abortStreamBubble(streamId) {
+    const entry = state.streamBubbles.get(streamId);
+    if (entry) {
+      entry.row.remove();
+      state.streamBubbles.delete(streamId);
+    }
+  }
+
+  function appendMessage(msg, streamId) {
     if (msg.id && state.messageIds.has(msg.id)) return;
     if (msg.id) state.messageIds.add(msg.id);
+
+    if (streamId && state.streamBubbles.has(streamId)) {
+      const entry = state.streamBubbles.get(streamId);
+      state.streamBubbles.delete(streamId);
+      state.messages.push(msg);
+      const timeStr = formatTime(msg.created_at);
+      entry.meta.textContent = timeStr ? `AI Assistant · ${timeStr}` : "AI Assistant";
+      renderFormattedMessage(entry.bubble, msg.content);
+      scrollToBottom();
+      if (!state.isOpen && msg.sender !== "user") {
+        state.unreadCount += 1;
+        renderUnread();
+      }
+      return;
+    }
 
     const wasEmpty = state.messages.length === 0;
     state.messages.push(msg);
@@ -880,7 +1133,7 @@
     }
 
     clearTimers();
-    const url = buildWebSocketUrl(state.sessionId);
+    const url = buildWebSocketUrl(state.sessionId, state.visitorToken);
     let ws;
     try {
       ws = new WebSocket(url);
@@ -917,6 +1170,7 @@
           if (data.session) {
             state.sessionState = data.session.state || "BOT_ACTIVE";
             state.assignedAgent = data.session.assigned_agent || null;
+            state.visitorEmail = data.session.visitor_email || null;
           }
           state.messages = Array.isArray(data.messages) ? data.messages : [];
           state.messageIds = new Set(state.messages.map((m) => m.id).filter(Boolean));
@@ -924,14 +1178,23 @@
           renderAllMessages();
           break;
 
+        case "message_stream":
+          handleStreamDelta(data.stream_id, data.delta);
+          break;
+
+        case "message_stream_abort":
+          abortStreamBubble(data.stream_id);
+          break;
+
         case "message":
           if (data.session) {
             state.sessionState = data.session.state || state.sessionState;
             state.assignedAgent = data.session.assigned_agent || null;
+            state.visitorEmail = data.session.visitor_email || state.visitorEmail;
             renderStatus();
           }
           if (data.message) {
-            appendMessage(data.message);
+            appendMessage(data.message, data.stream_id);
           }
           break;
 
@@ -939,6 +1202,7 @@
           if (data.session) {
             state.sessionState = data.session.state || state.sessionState;
             state.assignedAgent = data.session.assigned_agent || null;
+            state.visitorEmail = data.session.visitor_email || state.visitorEmail;
             renderStatus();
           }
           break;
@@ -977,6 +1241,18 @@
       renderTyping();
 
       if (evt.code === 1008) {
+        if ((evt.reason || "").toLowerCase().includes("token")) {
+          const newId = generateUUID();
+          const newToken = generateUUID();
+          setStoredSessionId(newId);
+          setStoredVisitorToken(newToken);
+          state.sessionId = newId;
+          state.visitorToken = newToken;
+          state.messages = [];
+          state.messageIds = new Set();
+          scheduleReconnect();
+          return;
+        }
         showError("This website origin is not authorized to connect to the support server.");
         return;
       }
@@ -1044,10 +1320,15 @@
 
   resetBtn.addEventListener("click", () => {
     const newId = generateUUID();
+    const newToken = generateUUID();
     setStoredSessionId(newId);
+    setStoredVisitorToken(newToken);
     state.sessionId = newId;
+    state.visitorToken = newToken;
+    state.visitorEmail = null;
     state.messages = [];
     state.messageIds = new Set();
+    state.streamBubbles.clear();
     state.sessionState = "BOT_ACTIVE";
     state.assignedAgent = null;
     state.typing = { active: false, label: "" };
@@ -1060,6 +1341,15 @@
     renderStatus();
     renderTyping();
     connectWebSocket();
+  });
+
+  emailBar.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const email = emailInput.value.trim();
+    if (!email) return;
+    if (sendJson({ type: "set_email", email })) {
+      emailInput.value = "";
+    }
   });
 
   humanBtn.addEventListener("click", () => {

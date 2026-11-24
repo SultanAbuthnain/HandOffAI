@@ -12,6 +12,7 @@ Serves:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import logging
 import os
@@ -36,7 +37,8 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
 try:
@@ -168,6 +170,7 @@ async def lifespan(_app: FastAPI):
         )
     yield
     await ws_manager.shutdown()
+    db.close()
     logger.info("AI Support HITL server shut down cleanly.")
 
 
@@ -178,6 +181,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if ALLOW_ALL_ORIGINS else sorted(ALLOWED_ORIGIN_SET),
@@ -235,15 +239,32 @@ async def serve_dashboard() -> FileResponse:
     )
 
 
+_WIDGET_ETAG_CACHE: dict[str, Any] = {"mtime_ns": None, "etag": None}
+
+
+def _get_widget_etag(widget_file: Path) -> str:
+    mtime_ns = widget_file.stat().st_mtime_ns
+    if _WIDGET_ETAG_CACHE["mtime_ns"] != mtime_ns:
+        digest = hashlib.sha256(widget_file.read_bytes()).hexdigest()[:16]
+        _WIDGET_ETAG_CACHE["mtime_ns"] = mtime_ns
+        _WIDGET_ETAG_CACHE["etag"] = f'"{digest}"'
+    return str(_WIDGET_ETAG_CACHE["etag"])
+
+
 @app.get("/widget.js", include_in_schema=False)
-async def serve_widget_js() -> FileResponse:
+async def serve_widget_js(request: Request) -> Response:
     widget_file = STATIC_DIR / "widget.js"
     if not widget_file.exists():
         raise HTTPException(status_code=404, detail="static/widget.js not found.")
+    etag = _get_widget_etag(widget_file)
+    headers = {"ETag": etag, "Cache-Control": "public, max-age=300"}
+    inm = (request.headers.get("if-none-match") or "").strip()
+    if inm and inm.removeprefix("W/") == etag:
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
     return FileResponse(
         widget_file,
         media_type="application/javascript; charset=utf-8",
-        headers={"Cache-Control": "no-cache"},
+        headers=headers,
     )
 
 
@@ -323,6 +344,7 @@ async def websocket_visitor_chat(
     ws: WebSocket,
     session_id: str,
     visitor_name: str = Query(default="Visitor", max_length=80),
+    visitor_token: Optional[str] = Query(default=None, max_length=128),
 ) -> None:
     origin = ws.headers.get("origin")
     host = ws.headers.get("host")
@@ -334,13 +356,19 @@ async def websocket_visitor_chat(
     clean_session_id = session_id.strip()[:120] or secrets.token_hex(16)
     client_ip = _extract_client_ip_from_ws(ws)
 
-    # Rate-limit creation of brand-new sessions to prevent SQLite session-table flooding
+    # Rate-limit creation of brand-new sessions and verify token for existing sessions
     existing_session = await asyncio.to_thread(db.get_session, clean_session_id)
     if existing_session is None:
         allowed, _retry_after = rate_limiter.allow(client_ip)
         if not allowed:
             logger.warning("Rate-limited new session creation from IP %s", client_ip)
             await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Rate limit exceeded")
+            return
+    else:
+        token_ok = await asyncio.to_thread(db.verify_visitor_token, clean_session_id, visitor_token)
+        if not token_ok:
+            logger.warning("Rejected invalid visitor_token for session %s", clean_session_id)
+            await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid session token")
             return
 
     await ws_manager.connect_visitor(
@@ -349,6 +377,7 @@ async def websocket_visitor_chat(
         visitor_name=visitor_name,
         origin=origin,
         client_ip=client_ip,
+        visitor_token=visitor_token,
     )
 
     try:
@@ -574,6 +603,21 @@ async def post_agent_message_endpoint(
     if not message:
         raise HTTPException(status_code=404, detail="Session not found.")
     return {"message": message}
+
+
+@app.post("/api/sessions/{session_id}/suggest", dependencies=[Depends(require_agent_auth)])
+async def suggest_agent_reply_endpoint(session_id: str) -> dict[str, Any]:
+    session = await asyncio.to_thread(db.get_session, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    history = await asyncio.to_thread(db.get_recent_conversation_history, session_id, 10)
+    try:
+        suggestion = await rag_engine.suggest_agent_reply(history)
+    except RAGConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except LLMProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return suggestion
 
 
 @app.delete("/api/sessions/{session_id}", dependencies=[Depends(require_agent_auth)])

@@ -16,10 +16,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
+import uuid
 from collections import defaultdict, deque
 from typing import Any, Optional
 
+import httpx
 from fastapi import WebSocket
 
 try:
@@ -195,9 +198,9 @@ class ConnectionManager:
         visitor_name: str = "Visitor",
         origin: Optional[str] = None,
         client_ip: Optional[str] = None,
+        visitor_token: Optional[str] = None,
     ) -> dict[str, Any]:
         await ws.accept()
-        self._visitor_sockets[session_id].add(ws)
 
         session = await asyncio.to_thread(
             self.db.get_or_create_session,
@@ -206,8 +209,13 @@ class ConnectionManager:
             None,
             origin,
             client_ip,
+            visitor_token,
         )
         messages = await asyncio.to_thread(self.db.get_messages, session["id"], 200)
+
+        # Register socket AFTER async DB reads and send `session_init` immediately
+        # so concurrent background broadcasts never arrive before `session_init`.
+        self._visitor_sockets[session_id].add(ws)
         enriched = self._enrich_session(session)
 
         await self._safe_send(
@@ -326,6 +334,39 @@ class ConnectionManager:
             )
             return
 
+        if event_type == "set_email":
+            allowed, retry_after = self.rate_limiter.allow(client_ip)
+            if not allowed:
+                await self._safe_send(
+                    ws,
+                    {
+                        "type": "error",
+                        "code": "rate_limited",
+                        "message": f"Too many requests. Please wait {retry_after}s and try again.",
+                        "retry_after": retry_after,
+                    },
+                )
+                return
+            email = str(payload.get("email", "")).strip()[:120]
+            if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+                await self._safe_send(
+                    ws,
+                    {
+                        "type": "error",
+                        "code": "invalid_email",
+                        "message": "Please enter a valid email address.",
+                    },
+                )
+                return
+            updated = await asyncio.to_thread(self.db.update_visitor_email, session_id, email)
+            if updated:
+                enriched = self._enrich_session(updated)
+                await self.broadcast_to_session_and_agents(
+                    session_id,
+                    {"type": "state_change", "session": enriched},
+                )
+            return
+
         if event_type == "message":
             raw_content = str(payload.get("content", "")).strip()
             if not raw_content:
@@ -398,8 +439,41 @@ class ConnectionManager:
         )
         self._ai_tasks[session_id] = task
 
+    async def _send_escalation_webhook(
+        self,
+        session: dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Fire an optional Slack/Discord/JSON webhook when a session escalates."""
+        webhook_url = os.getenv("ESCALATION_WEBHOOK_URL", "").strip()
+        if not webhook_url:
+            return
+        visitor_label = session.get("visitor_name") or "Visitor"
+        email_part = f" ({session['visitor_email']})" if session.get("visitor_email") else ""
+        text = (
+            f"[HandoffAI Escalation] {visitor_label}{email_part} "
+            f"[#{session['id'][:8]}]: {reason}"
+        )
+        payload = {
+            "event": "escalation",
+            "text": text,
+            "content": text,
+            "session_id": session["id"],
+            "visitor_name": visitor_label,
+            "visitor_email": session.get("visitor_email"),
+            "reason": reason,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(webhook_url, json=payload)
+        except Exception as exc:
+            logger.warning("Escalation webhook delivery failed: %s", exc)
+
     async def _run_ai_reply(self, session_id: str, user_text: str) -> None:
         current_task = asyncio.current_task()
+        stream_id = f"stream-{uuid.uuid4().hex[:12]}"
+        streamed_any = False
+
         await self.broadcast_to_session_and_agents(
             session_id,
             {
@@ -427,10 +501,29 @@ class ConnectionManager:
             escalation_reason: Optional[str]
             metadata: dict[str, Any]
 
+            async def _on_delta(delta: str) -> None:
+                nonlocal streamed_any
+                if self._ai_tasks.get(session_id) is not current_task:
+                    return
+                state_mid = await asyncio.to_thread(self.db.get_session_state, session_id)
+                if state_mid != SessionState.BOT_ACTIVE:
+                    return
+                streamed_any = True
+                await self.send_to_visitor(
+                    session_id,
+                    {
+                        "type": "message_stream",
+                        "session_id": session_id,
+                        "stream_id": stream_id,
+                        "delta": delta,
+                    },
+                )
+
             try:
-                rag_response = await self.rag.generate_reply(
+                rag_response = await self.rag.generate_reply_stream(
                     user_message=user_text,
                     conversation_history=history,
+                    on_delta=_on_delta,
                 )
                 rag_reply_text = rag_response.reply
                 should_escalate = rag_response.should_escalate
@@ -472,6 +565,15 @@ class ConnectionManager:
                         session_id,
                         state_now,
                     )
+                    if streamed_any:
+                        await self.send_to_visitor(
+                            session_id,
+                            {
+                                "type": "message_stream_abort",
+                                "session_id": session_id,
+                                "stream_id": stream_id,
+                            },
+                        )
                     return
 
                 bot_msg = await asyncio.to_thread(
@@ -487,6 +589,15 @@ class ConnectionManager:
                         "Atomic SQLite guard discarded AI reply for session %s (human took over).",
                         session_id,
                     )
+                    if streamed_any:
+                        await self.send_to_visitor(
+                            session_id,
+                            {
+                                "type": "message_stream_abort",
+                                "session_id": session_id,
+                                "stream_id": stream_id,
+                            },
+                        )
                     return
 
                 # Final verification before WebSocket dispatch
@@ -510,6 +621,7 @@ class ConnectionManager:
                     {
                         "type": "message",
                         "session_id": session_id,
+                        "stream_id": stream_id if streamed_any else None,
                         "message": bot_msg,
                         "session": updated_session,
                     },
@@ -523,16 +635,27 @@ class ConnectionManager:
                             "session": updated_session,
                         },
                     )
+                    reason_text = escalation_reason or "Escalated to human support"
                     await self.broadcast_to_agents(
                         {
                             "type": "escalation",
                             "session": updated_session,
-                            "reason": escalation_reason or "Escalated to human support",
+                            "reason": reason_text,
                         }
                     )
+                    asyncio.create_task(self._send_escalation_webhook(updated_session, reason_text))
 
         except asyncio.CancelledError:
             logger.info("Cancelled in-flight AI generation for session %s.", session_id)
+            if streamed_any:
+                await self.send_to_visitor(
+                    session_id,
+                    {
+                        "type": "message_stream_abort",
+                        "session_id": session_id,
+                        "stream_id": stream_id,
+                    },
+                )
         finally:
             is_active_task = self._ai_tasks.get(session_id) is current_task
             if is_active_task:
@@ -597,6 +720,7 @@ class ConnectionManager:
                     "reason": reason,
                 }
             )
+            asyncio.create_task(self._send_escalation_webhook(enriched, reason))
         return enriched
 
     # ------------------------------------------------------------------

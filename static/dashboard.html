@@ -1,0 +1,1185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agent Dashboard — AI Support HITL</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.3/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+    .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+    .scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 9999px; }
+    .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+  </style>
+</head>
+<body class="bg-slate-100 text-slate-900 antialiased h-screen overflow-hidden" x-data="agentDashboard()" x-init="init()">
+
+  <!-- Optional AGENT_API_KEY Auth Gate Modal -->
+  <div x-show="needsAuth" x-cloak class="fixed inset-0 z-50 bg-slate-900/70 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 border border-slate-200">
+      <div class="flex items-center gap-3 mb-4">
+        <div class="w-10 h-10 rounded-xl bg-blue-600 text-white flex items-center justify-center font-bold">AI</div>
+        <div>
+          <h2 class="text-lg font-bold text-slate-900">Agent Authentication Required</h2>
+          <p class="text-xs text-slate-500">Enter the AGENT_API_KEY configured in your .env file.</p>
+        </div>
+      </div>
+      <form @submit.prevent="submitApiKey()" class="space-y-4">
+        <input
+          type="password"
+          x-model="authKeyInput"
+          placeholder="Enter AGENT_API_KEY..."
+          class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm"
+          required
+        />
+        <p x-show="authError" x-text="authError" class="text-xs text-red-600 font-medium"></p>
+        <button type="submit" class="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm transition">
+          Unlock Dashboard
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Real-time Toast Notifications (Escalations & System Feedback) -->
+  <div class="fixed top-4 right-4 z-40 space-y-2 max-w-sm w-full pointer-events-none">
+    <template x-for="toast in toasts" :key="toast.id">
+      <div
+        class="pointer-events-auto rounded-xl shadow-lg border px-4 py-3 flex items-start gap-3 transition"
+        :class="{
+          'bg-amber-50 border-amber-300 text-amber-950': toast.kind === 'escalation',
+          'bg-emerald-50 border-emerald-300 text-emerald-950': toast.kind === 'success',
+          'bg-red-50 border-red-300 text-red-950': toast.kind === 'error',
+          'bg-white border-slate-200 text-slate-800': toast.kind === 'info'
+        }"
+      >
+        <div class="flex-1 min-w-0">
+          <div class="text-sm font-bold" x-text="toast.title"></div>
+          <div class="text-xs opacity-90 mt-0.5 break-words" x-text="toast.message"></div>
+          <template x-if="toast.sessionId">
+            <button
+              @click="activeTab = 'inbox'; selectSession(toast.sessionId); dismissToast(toast.id)"
+              class="mt-2 inline-flex items-center text-xs font-semibold px-2.5 py-1 rounded-lg bg-amber-600 text-white hover:bg-amber-700"
+            >
+              Open Escalated Chat →
+            </button>
+          </template>
+        </div>
+        <button @click="dismissToast(toast.id)" class="text-xs opacity-60 hover:opacity-100 font-bold">✕</button>
+      </div>
+    </template>
+  </div>
+
+  <!-- Main Shell -->
+  <div class="flex flex-col h-screen">
+
+    <!-- Top Navigation Bar -->
+    <header class="bg-white border-b border-slate-200 px-4 lg:px-6 h-16 flex items-center justify-between gap-4 flex-shrink-0">
+      <div class="flex items-center gap-3 min-w-0">
+        <div class="w-9 h-9 rounded-xl bg-blue-600 text-white flex items-center justify-center font-bold text-sm shadow-sm flex-shrink-0">
+          HITL
+        </div>
+        <div class="min-w-0">
+          <div class="flex items-center gap-2">
+            <h1 class="font-bold text-slate-900 text-sm sm:text-base truncate">AI Support Control Center</h1>
+            <span
+              class="inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-0.5 rounded-full"
+              :class="wsConnected ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-600 border border-slate-200'"
+            >
+              <span class="w-2 h-2 rounded-full" :class="wsConnected ? 'bg-emerald-500' : 'bg-slate-400 animate-pulse'"></span>
+              <span x-text="wsConnected ? 'Live' : 'Connecting'"></span>
+            </span>
+          </div>
+          <p class="text-xs text-slate-500 hidden sm:block truncate">
+            Provider: <span class="font-medium text-slate-700" x-text="aiInfo.provider || '—'"></span>
+            (<span x-text="aiInfo.chat_model || '—'"></span>) ·
+            KB: <span class="font-medium text-slate-700" x-text="kbStats.document_count"></span> docs /
+            <span class="font-medium text-slate-700" x-text="kbStats.chunk_count"></span> chunks
+          </p>
+        </div>
+      </div>
+
+      <!-- View Switcher Tabs -->
+      <nav class="flex items-center bg-slate-100 p-1 rounded-xl">
+        <button
+          @click="activeTab = 'inbox'"
+          class="px-3.5 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition flex items-center gap-2"
+          :class="activeTab === 'inbox' ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-600 hover:text-slate-900'"
+        >
+          <span>Live Chats</span>
+          <span
+            x-show="waitingCount > 0"
+            x-text="waitingCount"
+            class="px-1.5 py-0.5 text-[11px] rounded-full bg-amber-500 text-white font-bold animate-pulse"
+          ></span>
+        </button>
+        <button
+          @click="activeTab = 'kb'; loadDocuments()"
+          class="px-3.5 py-1.5 rounded-lg text-xs sm:text-sm font-semibold transition"
+          :class="activeTab === 'kb' ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-600 hover:text-slate-900'"
+        >
+          Knowledge Base
+        </button>
+      </nav>
+
+      <!-- Agent Controls -->
+      <div class="hidden md:flex items-center gap-2.5">
+        <label class="flex items-center gap-1.5 text-xs text-slate-500">
+          <span>Agent:</span>
+          <input
+            type="text"
+            x-model="agentName"
+            @change="saveAgentName()"
+            class="w-32 px-2.5 py-1 rounded-lg border border-slate-200 text-slate-800 text-xs font-medium focus:outline-none focus:border-blue-500"
+          />
+        </label>
+        <button
+          @click="soundEnabled = !soundEnabled"
+          class="px-2.5 py-1.5 rounded-lg border text-xs font-medium transition"
+          :class="soundEnabled ? 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50' : 'border-slate-200 bg-slate-100 text-slate-400'"
+          :title="soundEnabled ? 'Mute escalation sound' : 'Unmute escalation sound'"
+          x-text="soundEnabled ? 'Sound: On' : 'Sound: Muted'"
+        ></button>
+        <a
+          href="/demo"
+          target="_blank"
+          class="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition"
+        >
+          Open Widget Demo ↗
+        </a>
+      </div>
+    </header>
+
+    <!-- API Key Missing Warning Banner -->
+    <div x-show="aiInfo.configured === false" x-cloak class="bg-amber-50 border-b border-amber-200 px-6 py-2 text-xs text-amber-900 flex items-center justify-between">
+      <span>
+        <strong>Setup Notice:</strong> <code class="bg-amber-100 px-1.5 py-0.5 rounded">LLM_API_KEY</code> is not configured in <code class="bg-amber-100 px-1.5 py-0.5 rounded">.env</code> yet. Human takeover works now, and AI RAG replies + KB ingestion activate as soon as you add your key and restart.
+      </span>
+    </div>
+
+    <!-- =================================================================== -->
+    <!-- TAB 1: LIVE CONVERSATIONS (HITL INBOX)                              -->
+    <!-- =================================================================== -->
+    <main x-show="activeTab === 'inbox'" class="flex-1 flex min-h-0 overflow-hidden">
+
+      <!-- Left Sidebar: Session Queue -->
+      <aside class="w-80 lg:w-96 bg-white border-r border-slate-200 flex flex-col min-h-0 flex-shrink-0">
+        <!-- State Filters -->
+        <div class="p-3 border-b border-slate-200 space-y-2.5">
+          <div class="grid grid-cols-4 gap-1 bg-slate-100 p-1 rounded-xl text-[11px] font-semibold">
+            <button
+              @click="stateFilter = 'ALL'"
+              class="py-1.5 rounded-lg transition"
+              :class="stateFilter === 'ALL' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'"
+            >
+              All (<span x-text="sessions.length"></span>)
+            </button>
+            <button
+              @click="stateFilter = 'WAITING_FOR_HUMAN'"
+              class="py-1.5 rounded-lg transition"
+              :class="stateFilter === 'WAITING_FOR_HUMAN' ? 'bg-amber-500 text-white shadow-sm' : 'text-amber-700'"
+            >
+              Wait (<span x-text="waitingCount"></span>)
+            </button>
+            <button
+              @click="stateFilter = 'HUMAN_ACTIVE'"
+              class="py-1.5 rounded-lg transition"
+              :class="stateFilter === 'HUMAN_ACTIVE' ? 'bg-emerald-600 text-white shadow-sm' : 'text-emerald-700'"
+            >
+              Human (<span x-text="humanCount"></span>)
+            </button>
+            <button
+              @click="stateFilter = 'BOT_ACTIVE'"
+              class="py-1.5 rounded-lg transition"
+              :class="stateFilter === 'BOT_ACTIVE' ? 'bg-blue-600 text-white shadow-sm' : 'text-blue-700'"
+            >
+              Bot (<span x-text="botCount"></span>)
+            </button>
+          </div>
+        </div>
+
+        <!-- Session List -->
+        <div class="flex-1 overflow-y-auto scrollbar-thin divide-y divide-slate-100">
+          <template x-if="filteredSessions.length === 0">
+            <div class="p-8 text-center text-slate-400 text-sm">
+              <p class="font-medium text-slate-500">No conversations here yet</p>
+              <p class="text-xs mt-1">Open <a href="/demo" target="_blank" class="text-blue-600 underline">/demo</a> and send a message in the widget to test live HITL routing.</p>
+            </div>
+          </template>
+
+          <template x-for="sess in filteredSessions" :key="sess.id">
+            <button
+              @click="selectSession(sess.id)"
+              class="w-full text-left p-3.5 hover:bg-slate-50 transition block relative"
+              :class="{
+                'bg-blue-50/70 border-l-4 border-l-blue-600': selectedSessionId === sess.id,
+                'bg-amber-50/40': selectedSessionId !== sess.id && sess.state === 'WAITING_FOR_HUMAN'
+              }"
+            >
+              <div class="flex items-center justify-between gap-2">
+                <div class="flex items-center gap-2 min-w-0">
+                  <span
+                    class="w-2.5 h-2.5 rounded-full flex-shrink-0"
+                    :class="sess.visitor_online ? 'bg-emerald-500' : 'bg-slate-300'"
+                    :title="sess.visitor_online ? 'Visitor online' : 'Visitor offline'"
+                  ></span>
+                  <span class="font-semibold text-sm text-slate-900 truncate" x-text="sess.visitor_name || 'Visitor'"></span>
+                  <span class="text-[10px] font-mono text-slate-400" x-text="'#' + sess.id.slice(0, 6)"></span>
+                </div>
+                <span class="text-[11px] text-slate-400 flex-shrink-0" x-text="formatShortTime(sess.last_message_at)"></span>
+              </div>
+
+              <div class="mt-1.5 flex items-center gap-1.5">
+                <span
+                  class="text-[10.5px] font-bold px-2 py-0.5 rounded-full"
+                  :class="stateBadgeClass(sess.state)"
+                  x-text="stateLabel(sess.state)"
+                ></span>
+                <span
+                  x-show="sess.assigned_agent && sess.state === 'HUMAN_ACTIVE'"
+                  class="text-[11px] text-slate-500 truncate"
+                  x-text="'· ' + sess.assigned_agent"
+                ></span>
+              </div>
+
+              <p
+                class="mt-1.5 text-xs text-slate-600 truncate"
+                x-text="sess.last_message_preview || 'No messages yet'"
+              ></p>
+
+              <p
+                x-show="sess.state === 'WAITING_FOR_HUMAN' && sess.escalation_reason"
+                class="mt-1 text-[11px] text-amber-800 font-medium truncate"
+                x-text="'Escalated: ' + sess.escalation_reason"
+              ></p>
+            </button>
+          </template>
+        </div>
+      </aside>
+
+      <!-- Right Main Area: Selected Conversation -->
+      <section class="flex-1 flex flex-col min-w-0 min-h-0 bg-slate-50">
+        <template x-if="!selectedSession">
+          <div class="flex-1 flex items-center justify-center p-8 text-center">
+            <div class="max-w-md">
+              <div class="w-14 h-14 mx-auto rounded-2xl bg-blue-100 text-blue-600 flex items-center justify-center mb-4">
+                <svg class="w-7 h-7" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                </svg>
+              </div>
+              <h2 class="text-lg font-bold text-slate-800">Select a conversation</h2>
+              <p class="text-sm text-slate-500 mt-1">
+                Monitor AI replies in real time, respond to escalations, or click <strong>Take Over</strong> on any chat to lock out the bot and speak directly with the customer.
+              </p>
+            </div>
+          </div>
+        </template>
+
+        <template x-if="selectedSession">
+          <div class="flex-1 flex flex-col min-h-0">
+            <!-- Chat Header & HITL Controls -->
+            <div class="bg-white border-b border-slate-200 px-5 py-3.5 flex flex-wrap items-center justify-between gap-3 flex-shrink-0">
+              <div class="min-w-0">
+                <div class="flex items-center gap-2.5">
+                  <h2 class="font-bold text-slate-900 text-base truncate" x-text="selectedSession.visitor_name || 'Visitor'"></h2>
+                  <span
+                    class="text-xs font-bold px-2.5 py-0.5 rounded-full"
+                    :class="stateBadgeClass(selectedSession.state)"
+                    x-text="stateLabel(selectedSession.state)"
+                  ></span>
+                  <span
+                    class="text-xs font-medium"
+                    :class="selectedSession.visitor_online ? 'text-emerald-600' : 'text-slate-400'"
+                    x-text="selectedSession.visitor_online ? '● Online' : '○ Offline'"
+                  ></span>
+                </div>
+                <div class="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-2">
+                  <span class="font-mono" x-text="'Session: ' + selectedSession.id.slice(0, 12)"></span>
+                  <span x-show="selectedSession.origin" x-text="'· Origin: ' + selectedSession.origin"></span>
+                  <span x-show="selectedSession.assigned_agent" x-text="'· Assigned: ' + selectedSession.assigned_agent"></span>
+                </div>
+              </div>
+
+              <!-- HITL State Machine Action Buttons -->
+              <div class="flex items-center gap-2">
+                <button
+                  x-show="selectedSession.state !== 'HUMAN_ACTIVE'"
+                  @click="takeOver(selectedSession.id)"
+                  class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs sm:text-sm font-semibold shadow-sm transition"
+                >
+                  Take Over Chat
+                </button>
+                <button
+                  x-show="selectedSession.state === 'HUMAN_ACTIVE'"
+                  @click="releaseToBot(selectedSession.id)"
+                  class="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs sm:text-sm font-semibold shadow-sm transition"
+                >
+                  Release to Bot
+                </button>
+                <button
+                  @click="deleteSession(selectedSession.id)"
+                  class="px-3 py-2 rounded-xl border border-slate-200 hover:border-red-300 hover:bg-red-50 hover:text-red-700 text-slate-600 text-xs font-semibold transition"
+                  title="Delete conversation"
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+
+            <!-- Escalation Alert Banner -->
+            <div
+              x-show="selectedSession.state === 'WAITING_FOR_HUMAN'"
+              class="bg-amber-50 border-b border-amber-200 px-5 py-2.5 flex items-center justify-between gap-3 flex-shrink-0"
+            >
+              <div class="text-xs sm:text-sm text-amber-900">
+                <strong class="font-bold">Escalation Pending:</strong>
+                <span x-text="selectedSession.escalation_reason || 'Customer requires human assistance.'"></span>
+              </div>
+              <button
+                @click="takeOver(selectedSession.id)"
+                class="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold flex-shrink-0"
+              >
+                Take Over Now
+              </button>
+            </div>
+
+            <!-- Messages Stream -->
+            <div x-ref="messagesContainer" class="flex-1 overflow-y-auto scrollbar-thin p-5 space-y-3.5">
+              <template x-for="msg in selectedMessages" :key="msg.id">
+                <div
+                  class="flex flex-col"
+                  :class="{
+                    'items-start': msg.sender === 'user',
+                    'items-end': msg.sender === 'bot' || msg.sender === 'agent',
+                    'items-center': msg.sender === 'system'
+                  }"
+                >
+                  <template x-if="msg.sender === 'system'">
+                    <div class="bg-slate-200/80 text-slate-600 text-xs font-medium px-3.5 py-1 rounded-full">
+                      <span x-text="msg.content"></span>
+                      <span class="opacity-70 ml-1" x-text="'· ' + formatShortTime(msg.created_at)"></span>
+                    </div>
+                  </template>
+
+                  <template x-if="msg.sender !== 'system'">
+                    <div class="max-w-[78%] sm:max-w-[70%]">
+                      <div
+                        class="text-[11px] font-medium text-slate-500 mb-1 px-1 flex items-center gap-1.5"
+                        :class="msg.sender === 'user' ? 'justify-start' : 'justify-end'"
+                      >
+                        <span x-text="senderDisplayName(msg)"></span>
+                        <span>·</span>
+                        <span x-text="formatShortTime(msg.created_at)"></span>
+                      </div>
+                      <div
+                        class="px-4 py-2.5 rounded-2xl text-sm whitespace-pre-wrap break-words shadow-sm"
+                        :class="{
+                          'bg-white border border-slate-200 text-slate-900 rounded-bl-sm': msg.sender === 'user',
+                          'bg-blue-600 text-white rounded-br-sm': msg.sender === 'bot',
+                          'bg-emerald-600 text-white rounded-br-sm': msg.sender === 'agent'
+                        }"
+                        x-text="msg.content"
+                      ></div>
+
+                      <!-- RAG Grounding Metadata Pill for Bot Messages -->
+                      <template x-if="msg.sender === 'bot' && msg.metadata && msg.metadata.sources && msg.metadata.sources.length > 0">
+                        <div class="mt-1.5 flex flex-wrap justify-end gap-1">
+                          <span class="text-[10.5px] bg-blue-50 text-blue-700 border border-blue-200 px-2 py-0.5 rounded-md font-medium">
+                            Confidence: <span x-text="Math.round((msg.metadata.confidence || 0) * 100) + '%'"></span>
+                          </span>
+                          <template x-for="src in msg.metadata.sources" :key="src.chunk_id">
+                            <span class="text-[10.5px] bg-slate-100 text-slate-600 border border-slate-200 px-2 py-0.5 rounded-md" x-text="src.document_title + ' (' + Math.round(src.score * 100) + '%)'"></span>
+                          </template>
+                        </div>
+                      </template>
+                    </div>
+                  </template>
+                </div>
+              </template>
+
+              <!-- Live Bot Generating Indicator -->
+              <div x-show="botTypingSessions[selectedSession.id]" class="flex justify-end">
+                <div class="bg-blue-50 border border-blue-200 text-blue-700 text-xs font-medium px-3.5 py-2 rounded-2xl">
+                  AI is generating a response... (click <strong>Take Over</strong> to abort)
+                </div>
+              </div>
+            </div>
+
+            <!-- Agent Reply Composer -->
+            <form @submit.prevent="sendReply()" class="bg-white border-t border-slate-200 p-4 flex-shrink-0">
+              <div class="flex items-end gap-3">
+                <textarea
+                  x-model="replyText"
+                  @input="notifyAgentTyping()"
+                  @keydown.enter.prevent="if (!$event.shiftKey) sendReply()"
+                  rows="2"
+                  :placeholder="selectedSession.state === 'HUMAN_ACTIVE'
+                    ? 'Reply as ' + agentName + '... (Enter to send)'
+                    : 'Type a reply to automatically Take Over and respond as ' + agentName + '...'"
+                  class="flex-1 resize-none rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+                ></textarea>
+                <button
+                  type="submit"
+                  :disabled="!replyText.trim()"
+                  class="px-5 py-2.5 h-[44px] rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white font-semibold text-sm transition flex-shrink-0"
+                >
+                  Send
+                </button>
+              </div>
+              <div class="mt-1.5 flex items-center justify-between text-[11px] text-slate-400">
+                <span x-show="selectedSession.state === 'BOT_ACTIVE'">AI is currently active. Sending a message or clicking Take Over immediately locks this chat to Human mode.</span>
+                <span x-show="selectedSession.state === 'WAITING_FOR_HUMAN'" class="text-amber-700 font-medium">AI is paused while waiting for a human agent.</span>
+                <span x-show="selectedSession.state === 'HUMAN_ACTIVE'" class="text-emerald-700 font-medium">Human lock active — AI will not respond until you click "Release to Bot".</span>
+                <span>Shift+Enter for new line</span>
+              </div>
+            </form>
+          </div>
+        </template>
+      </section>
+    </main>
+
+    <!-- =================================================================== -->
+    <!-- TAB 2: KNOWLEDGE BASE (RAG PIPELINE & EMBED SNIPPET)                -->
+    <!-- =================================================================== -->
+    <main x-show="activeTab === 'kb'" x-cloak class="flex-1 overflow-y-auto scrollbar-thin p-4 lg:p-8">
+      <div class="max-w-6xl mx-auto space-y-6">
+
+        <!-- KPI Summary Cards -->
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          <div class="bg-white rounded-2xl border border-slate-200 p-4">
+            <div class="text-xs font-semibold text-slate-500 uppercase">Documents</div>
+            <div class="text-2xl font-bold text-slate-900 mt-1" x-text="kbStats.document_count"></div>
+          </div>
+          <div class="bg-white rounded-2xl border border-slate-200 p-4">
+            <div class="text-xs font-semibold text-slate-500 uppercase">Indexed Chunks</div>
+            <div class="text-2xl font-bold text-slate-900 mt-1" x-text="kbStats.chunk_count"></div>
+          </div>
+          <div class="bg-white rounded-2xl border border-slate-200 p-4">
+            <div class="text-xs font-semibold text-slate-500 uppercase">Chat Model</div>
+            <div class="text-base font-bold text-blue-700 mt-1 truncate" x-text="(aiInfo.provider || '') + ' / ' + (aiInfo.chat_model || '—')"></div>
+          </div>
+          <div class="bg-white rounded-2xl border border-slate-200 p-4">
+            <div class="text-xs font-semibold text-slate-500 uppercase">Embedding Model</div>
+            <div class="text-base font-bold text-slate-800 mt-1 truncate" x-text="aiInfo.embedding_model || '—'"></div>
+          </div>
+        </div>
+
+        <!-- Ingestion Forms Grid -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <!-- Ingest Text / Markdown -->
+          <div class="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm">
+            <h2 class="text-base font-bold text-slate-900">Add Text or Markdown</h2>
+            <p class="text-xs text-slate-500 mt-0.5">Automatically chunked (~500 chars with overlap) and embedded locally in SQLite.</p>
+
+            <form @submit.prevent="ingestText()" class="mt-4 space-y-3">
+              <div class="grid grid-cols-3 gap-3">
+                <input
+                  type="text"
+                  x-model="kbTitle"
+                  placeholder="Document title (e.g. Refund Policy)"
+                  class="col-span-2 px-3.5 py-2 rounded-xl border border-slate-300 text-sm focus:outline-none focus:border-blue-500"
+                  required
+                />
+                <select
+                  x-model="kbSourceType"
+                  class="px-3 py-2 rounded-xl border border-slate-300 text-sm bg-white focus:outline-none focus:border-blue-500"
+                >
+                  <option value="markdown">Markdown</option>
+                  <option value="text">Plain Text</option>
+                </select>
+              </div>
+              <textarea
+                x-model="kbContent"
+                rows="6"
+                placeholder="Paste your FAQ, product documentation, or support policies here..."
+                class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm focus:outline-none focus:border-blue-500"
+                required
+              ></textarea>
+              <button
+                type="submit"
+                :disabled="kbBusy"
+                class="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-semibold text-sm transition"
+                x-text="kbBusy ? 'Chunking & Embedding...' : 'Ingest & Index Document'"
+              ></button>
+            </form>
+          </div>
+
+          <!-- Upload .txt / .md File + Test Retrieval -->
+          <div class="space-y-6">
+            <div class="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm">
+              <h2 class="text-base font-bold text-slate-900">Upload .txt or .md File</h2>
+              <p class="text-xs text-slate-500 mt-0.5">Upload documentation files up to 5 MB directly into the local vector store.</p>
+              <form @submit.prevent="uploadFile()" class="mt-4 flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+                <input
+                  type="file"
+                  accept=".txt,.md,.markdown"
+                  x-ref="fileInput"
+                  class="flex-1 text-xs text-slate-600 file:mr-3 file:py-2 file:px-3.5 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+                  required
+                />
+                <button
+                  type="submit"
+                  :disabled="kbBusy"
+                  class="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-semibold transition"
+                >
+                  Upload & Index
+                </button>
+              </form>
+            </div>
+
+            <!-- Retrieval Debugger -->
+            <div class="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm">
+              <h2 class="text-base font-bold text-slate-900">Test RAG Retrieval</h2>
+              <p class="text-xs text-slate-500 mt-0.5">Verify cosine similarity scores before going live.</p>
+              <form @submit.prevent="testSearch()" class="mt-3 flex gap-2">
+                <input
+                  type="text"
+                  x-model="searchQuery"
+                  placeholder="Ask a sample customer question..."
+                  class="flex-1 px-3.5 py-2 rounded-xl border border-slate-300 text-sm focus:outline-none focus:border-blue-500"
+                  required
+                />
+                <button
+                  type="submit"
+                  :disabled="searchBusy"
+                  class="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-semibold"
+                >
+                  Search
+                </button>
+              </form>
+              <div x-show="searchResults !== null" class="mt-3 space-y-2 max-h-48 overflow-y-auto scrollbar-thin">
+                <template x-if="searchResults && searchResults.length === 0">
+                  <div class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl p-2.5">
+                    No chunks exceeded the similarity threshold — this query will trigger <strong>[ESCALATE]</strong> to a human agent.
+                  </div>
+                </template>
+                <template x-for="res in (searchResults || [])" :key="res.chunk_id">
+                  <div class="text-xs bg-slate-50 border border-slate-200 rounded-xl p-2.5">
+                    <div class="flex items-center justify-between font-semibold text-slate-700">
+                      <span x-text="res.document_title + ' (chunk #' + res.chunk_index + ')'"></span>
+                      <span class="text-emerald-700" x-text="'Score: ' + res.score.toFixed(3)"></span>
+                    </div>
+                    <p class="text-slate-600 mt-1 whitespace-pre-wrap" x-text="res.content"></p>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Indexed Documents Table -->
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div class="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
+            <h2 class="text-base font-bold text-slate-900">Indexed Knowledge Base Documents</h2>
+            <button @click="loadDocuments()" class="text-xs font-semibold text-blue-600 hover:underline">Refresh</button>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-sm">
+              <thead class="bg-slate-50 text-xs text-slate-500 uppercase border-b border-slate-200">
+                <tr>
+                  <th class="px-5 py-3">Title</th>
+                  <th class="px-5 py-3">Type</th>
+                  <th class="px-5 py-3">Chunks</th>
+                  <th class="px-5 py-3">Size</th>
+                  <th class="px-5 py-3">Embedding Model</th>
+                  <th class="px-5 py-3 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100">
+                <template x-if="documents.length === 0">
+                  <tr>
+                    <td colspan="6" class="px-5 py-8 text-center text-slate-400 text-sm">
+                      No documents indexed yet. Add text, Markdown, or upload a .txt/.md file above.
+                    </td>
+                  </tr>
+                </template>
+                <template x-for="doc in documents" :key="doc.id">
+                  <tr class="hover:bg-slate-50">
+                    <td class="px-5 py-3 font-semibold text-slate-900" x-text="doc.title"></td>
+                    <td class="px-5 py-3"><span class="text-xs px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 font-medium" x-text="doc.source_type"></span></td>
+                    <td class="px-5 py-3 text-slate-600" x-text="doc.chunk_count"></td>
+                    <td class="px-5 py-3 text-slate-600" x-text="doc.char_count.toLocaleString() + ' chars'"></td>
+                    <td class="px-5 py-3 text-xs font-mono text-slate-500" x-text="doc.embedding_model || '—'"></td>
+                    <td class="px-5 py-3 text-right">
+                      <button @click="deleteDocument(doc.id)" class="text-xs font-semibold text-red-600 hover:text-red-800">Delete</button>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Single-Tag Embed Snippet -->
+        <div class="bg-slate-900 text-slate-100 rounded-2xl p-5 shadow-sm">
+          <div class="flex items-center justify-between gap-4">
+            <div>
+              <h2 class="text-sm font-bold text-white">Embed on Any Website (Single Script Tag)</h2>
+              <p class="text-xs text-slate-400 mt-0.5">Remember to add your host domain to <code class="text-slate-200">ALLOWED_ORIGINS</code> in <code class="text-slate-200">.env</code>.</p>
+            </div>
+            <button @click="copyEmbedSnippet()" class="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold transition">
+              Copy Snippet
+            </button>
+          </div>
+          <pre class="mt-3 p-3.5 rounded-xl bg-slate-950 text-xs font-mono text-emerald-300 overflow-x-auto" x-text="embedSnippet"></pre>
+        </div>
+
+      </div>
+    </main>
+  </div>
+
+  <script>
+    function agentDashboard() {
+      return {
+        // Navigation & UI state
+        activeTab: "inbox",
+        stateFilter: "ALL",
+        soundEnabled: true,
+        agentName: localStorage.getItem("ai_support_agent_name") || "Support Agent",
+
+        // Auth state (only required if AGENT_API_KEY is set in .env)
+        apiKey: sessionStorage.getItem("ai_support_agent_key") || "",
+        needsAuth: false,
+        authKeyInput: "",
+        authError: "",
+
+        // Connection & System metadata
+        ws: null,
+        wsConnected: false,
+        reconnectTimer: null,
+        heartbeatTimer: null,
+        aiInfo: {},
+        kbStats: { document_count: 0, chunk_count: 0, embedding_models: [] },
+
+        // Sessions & Messages
+        sessions: [],
+        selectedSessionId: null,
+        messagesBySession: {},
+        botTypingSessions: {},
+        replyText: "",
+        typingTimer: null,
+
+        // Knowledge Base UI state
+        documents: [],
+        kbTitle: "",
+        kbSourceType: "markdown",
+        kbContent: "",
+        kbBusy: false,
+        searchQuery: "",
+        searchBusy: false,
+        searchResults: null,
+
+        // Toasts & Audio
+        toasts: [],
+        toastSeq: 0,
+        audioCtx: null,
+
+        get embedSnippet() {
+          return `<script src="${window.location.origin}/widget.js" data-title="Support Assistant" data-color="#2563eb"><\/script>`;
+        },
+
+        get waitingCount() {
+          return this.sessions.filter((s) => s.state === "WAITING_FOR_HUMAN").length;
+        },
+        get humanCount() {
+          return this.sessions.filter((s) => s.state === "HUMAN_ACTIVE").length;
+        },
+        get botCount() {
+          return this.sessions.filter((s) => s.state === "BOT_ACTIVE").length;
+        },
+
+        get filteredSessions() {
+          const list =
+            this.stateFilter === "ALL"
+              ? [...this.sessions]
+              : this.sessions.filter((s) => s.state === this.stateFilter);
+          const priority = { WAITING_FOR_HUMAN: 0, HUMAN_ACTIVE: 1, BOT_ACTIVE: 2 };
+          return list.sort((a, b) => {
+            const pDiff = (priority[a.state] ?? 3) - (priority[b.state] ?? 3);
+            if (pDiff !== 0) return pDiff;
+            return (b.last_message_at || "").localeCompare(a.last_message_at || "");
+          });
+        },
+
+        get selectedSession() {
+          return this.sessions.find((s) => s.id === this.selectedSessionId) || null;
+        },
+
+        get selectedMessages() {
+          return this.messagesBySession[this.selectedSessionId] || [];
+        },
+
+        async init() {
+          try {
+            const res = await fetch("/api/health");
+            const data = await res.json();
+            this.aiInfo = data.ai || {};
+            this.kbStats = data.kb || this.kbStats;
+            if (data.auth_required && !this.apiKey) {
+              this.needsAuth = true;
+              return;
+            }
+          } catch (_err) {
+            this.addToast("error", "Server Unreachable", "Could not reach /api/health.");
+          }
+          this.connectWS();
+          this.loadDocuments();
+        },
+
+        async submitApiKey() {
+          this.authError = "";
+          const candidate = this.authKeyInput.trim();
+          const res = await fetch("/api/kb/documents", {
+            headers: { "X-Agent-Key": candidate },
+          });
+          if (!res.ok) {
+            this.authError = "Invalid API key. Please check AGENT_API_KEY in .env.";
+            return;
+          }
+          this.apiKey = candidate;
+          sessionStorage.setItem("ai_support_agent_key", candidate);
+          this.needsAuth = false;
+          this.connectWS();
+          this.loadDocuments();
+        },
+
+        authHeaders(extra = {}) {
+          const headers = { ...extra };
+          if (this.apiKey) headers["X-Agent-Key"] = this.apiKey;
+          return headers;
+        },
+
+        saveAgentName() {
+          this.agentName = (this.agentName || "Support Agent").trim().slice(0, 60) || "Support Agent";
+          localStorage.setItem("ai_support_agent_name", this.agentName);
+        },
+
+        // -----------------------------------------------------------------
+        // WebSocket Connection
+        // -----------------------------------------------------------------
+        connectWS() {
+          if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+            return;
+          }
+          const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+          const ws = new WebSocket(`${proto}//${window.location.host}/ws/agent`);
+          this.ws = ws;
+
+          ws.onopen = () => {
+            if (this.apiKey) {
+              ws.send(JSON.stringify({ type: "auth", api_key: this.apiKey }));
+            }
+            this.wsConnected = true;
+            if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = setInterval(() => {
+              if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" }));
+            }, 25000);
+          };
+
+          ws.onmessage = (evt) => {
+            let data;
+            try {
+              data = JSON.parse(evt.data);
+            } catch (_err) {
+              return;
+            }
+            this.handleWsEvent(data);
+          };
+
+          ws.onclose = (evt) => {
+            this.wsConnected = false;
+            if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+            if (evt.code === 1008) {
+              this.apiKey = "";
+              sessionStorage.removeItem("ai_support_agent_key");
+              this.needsAuth = true;
+              this.authError = "Authentication failed. Please re-enter AGENT_API_KEY.";
+              return;
+            }
+            if (!this.reconnectTimer) {
+              this.reconnectTimer = setTimeout(() => {
+                this.reconnectTimer = null;
+                this.connectWS();
+              }, 2500);
+            }
+          };
+        },
+
+        handleWsEvent(data) {
+          switch (data.type) {
+            case "dashboard_init":
+              this.sessions = data.sessions || [];
+              if (data.kb_stats) this.kbStats = data.kb_stats;
+              if (data.ai_info) this.aiInfo = data.ai_info;
+              if (!this.selectedSessionId && this.filteredSessions.length > 0) {
+                this.selectSession(this.filteredSessions[0].id);
+              }
+              break;
+
+            case "session_updated":
+            case "state_change":
+              if (data.session) this.upsertSession(data.session);
+              break;
+
+            case "presence": {
+              const idx = this.sessions.findIndex((s) => s.id === data.session_id);
+              if (idx !== -1) {
+                this.sessions[idx] = { ...this.sessions[idx], visitor_online: Boolean(data.visitor_online) };
+              }
+              break;
+            }
+
+            case "message":
+              if (data.session) this.upsertSession(data.session);
+              if (data.session_id && data.message) {
+                const list = this.messagesBySession[data.session_id];
+                if (list) {
+                  if (!list.some((m) => m.id === data.message.id)) {
+                    list.push(data.message);
+                  }
+                  if (this.selectedSessionId === data.session_id) {
+                    this.scrollMessagesToBottom();
+                  }
+                }
+              }
+              break;
+
+            case "typing":
+              if (data.sender === "bot" && data.session_id) {
+                this.botTypingSessions = {
+                  ...this.botTypingSessions,
+                  [data.session_id]: Boolean(data.is_typing),
+                };
+              }
+              break;
+
+            case "escalation":
+              if (data.session) this.upsertSession(data.session);
+              this.playAlertSound();
+              this.addToast(
+                "escalation",
+                "Human Support Requested",
+                `${(data.session && data.session.visitor_name) || "Visitor"}: ${data.reason || "Needs human agent"}`,
+                data.session ? data.session.id : null
+              );
+              break;
+
+            case "kb_updated":
+              if (data.kb_stats) this.kbStats = data.kb_stats;
+              if (this.activeTab === "kb") this.loadDocuments();
+              break;
+
+            case "session_deleted":
+              this.sessions = this.sessions.filter((s) => s.id !== data.session_id);
+              delete this.messagesBySession[data.session_id];
+              if (this.selectedSessionId === data.session_id) {
+                this.selectedSessionId = this.filteredSessions[0]?.id || null;
+                if (this.selectedSessionId) this.selectSession(this.selectedSessionId);
+              }
+              break;
+
+            case "error":
+              this.addToast("error", "Action Failed", data.message || "Unknown WebSocket error");
+              break;
+          }
+        },
+
+        upsertSession(session) {
+          const idx = this.sessions.findIndex((s) => s.id === session.id);
+          if (idx === -1) {
+            this.sessions.unshift(session);
+          } else {
+            this.sessions[idx] = { ...this.sessions[idx], ...session };
+          }
+        },
+
+        async selectSession(sessionId) {
+          this.selectedSessionId = sessionId;
+          try {
+            const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+              headers: this.authHeaders(),
+            });
+            if (!res.ok) return;
+            const data = await res.json();
+            if (data.session) this.upsertSession(data.session);
+            this.messagesBySession[sessionId] = data.messages || [];
+            this.scrollMessagesToBottom();
+          } catch (_err) {
+            this.addToast("error", "Error", "Failed to load conversation history.");
+          }
+        },
+
+        // -----------------------------------------------------------------
+        // HITL Actions
+        // -----------------------------------------------------------------
+        sendWs(payload) {
+          if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            this.addToast("error", "Disconnected", "WebSocket is reconnecting. Please retry in a moment.");
+            return false;
+          }
+          this.ws.send(JSON.stringify(payload));
+          return true;
+        },
+
+        takeOver(sessionId) {
+          this.sendWs({
+            type: "take_over",
+            session_id: sessionId,
+            agent_name: this.agentName,
+          });
+        },
+
+        releaseToBot(sessionId) {
+          this.sendWs({
+            type: "release_to_bot",
+            session_id: sessionId,
+            agent_name: this.agentName,
+          });
+        },
+
+        sendReply() {
+          const content = this.replyText.trim();
+          if (!content || !this.selectedSessionId) return;
+          if (
+            this.sendWs({
+              type: "agent_message",
+              session_id: this.selectedSessionId,
+              content,
+              agent_name: this.agentName,
+            })
+          ) {
+            this.replyText = "";
+            this.sendWs({
+              type: "typing",
+              session_id: this.selectedSessionId,
+              agent_name: this.agentName,
+              is_typing: false,
+            });
+          }
+        },
+
+        notifyAgentTyping() {
+          if (!this.selectedSessionId || !this.wsConnected) return;
+          this.sendWs({
+            type: "typing",
+            session_id: this.selectedSessionId,
+            agent_name: this.agentName,
+            is_typing: true,
+          });
+          if (this.typingTimer) clearTimeout(this.typingTimer);
+          this.typingTimer = setTimeout(() => {
+            if (this.selectedSessionId && this.wsConnected) {
+              this.sendWs({
+                type: "typing",
+                session_id: this.selectedSessionId,
+                agent_name: this.agentName,
+                is_typing: false,
+              });
+            }
+          }, 2000);
+        },
+
+        async deleteSession(sessionId) {
+          if (!confirm("Delete this conversation and all its messages permanently?")) return;
+          const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+            method: "DELETE",
+            headers: this.authHeaders(),
+          });
+          if (res.ok) {
+            this.addToast("info", "Deleted", "Conversation removed.");
+          }
+        },
+
+        // -----------------------------------------------------------------
+        // Knowledge Base Operations
+        // -----------------------------------------------------------------
+        async loadDocuments() {
+          try {
+            const res = await fetch("/api/kb/documents", { headers: this.authHeaders() });
+            if (!res.ok) return;
+            const data = await res.json();
+            this.documents = data.documents || [];
+            if (data.stats) this.kbStats = data.stats;
+          } catch (_err) {
+            // ignore
+          }
+        },
+
+        async ingestText() {
+          if (!this.kbTitle.trim() || !this.kbContent.trim()) return;
+          this.kbBusy = true;
+          try {
+            const res = await fetch("/api/kb/ingest/text", {
+              method: "POST",
+              headers: this.authHeaders({ "Content-Type": "application/json" }),
+              body: JSON.stringify({
+                title: this.kbTitle.trim(),
+                content: this.kbContent.trim(),
+                source_type: this.kbSourceType,
+              }),
+            });
+            const data = await res.json();
+            if (!res.ok) {
+              this.addToast("error", "Ingestion Failed", data.detail || "Could not ingest document.");
+              return;
+            }
+            this.kbTitle = "";
+            this.kbContent = "";
+            this.addToast("success", "Document Indexed", `Stored "${data.document.title}" (${data.document.chunk_count} chunks).`);
+            await this.loadDocuments();
+          } finally {
+            this.kbBusy = false;
+          }
+        },
+
+        async uploadFile() {
+          const input = this.$refs.fileInput;
+          if (!input || !input.files || !input.files[0]) return;
+          this.kbBusy = true;
+          try {
+            const form = new FormData();
+            form.append("file", input.files[0]);
+            const res = await fetch("/api/kb/ingest/file", {
+              method: "POST",
+              headers: this.authHeaders(),
+              body: form,
+            });
+            const data = await res.json();
+            if (!res.ok) {
+              this.addToast("error", "Upload Failed", data.detail || "Could not upload file.");
+              return;
+            }
+            input.value = "";
+            this.addToast("success", "File Indexed", `Stored "${data.document.title}" (${data.document.chunk_count} chunks).`);
+            await this.loadDocuments();
+          } finally {
+            this.kbBusy = false;
+          }
+        },
+
+        async deleteDocument(docId) {
+          if (!confirm("Delete this document and its vector embeddings?")) return;
+          const res = await fetch(`/api/kb/documents/${encodeURIComponent(docId)}`, {
+            method: "DELETE",
+            headers: this.authHeaders(),
+          });
+          if (res.ok) {
+            this.addToast("info", "Document Removed", "Chunks deleted from SQLite.");
+            await this.loadDocuments();
+          }
+        },
+
+        async testSearch() {
+          if (!this.searchQuery.trim()) return;
+          this.searchBusy = true;
+          try {
+            const res = await fetch("/api/kb/search", {
+              method: "POST",
+              headers: this.authHeaders({ "Content-Type": "application/json" }),
+              body: JSON.stringify({ query: this.searchQuery.trim(), top_k: 4 }),
+            });
+            const data = await res.json();
+            if (!res.ok) {
+              this.addToast("error", "Search Failed", data.detail || "Unable to search Knowledge Base.");
+              return;
+            }
+            this.searchResults = data.results || [];
+          } finally {
+            this.searchBusy = false;
+          }
+        },
+
+        async copyEmbedSnippet() {
+          try {
+            await navigator.clipboard.writeText(this.embedSnippet);
+            this.addToast("success", "Copied", "Widget <script> tag copied to clipboard.");
+          } catch (_err) {
+            this.addToast("info", "Copy Manually", "Select and copy the snippet from the code box.");
+          }
+        },
+
+        // -----------------------------------------------------------------
+        // Formatting & Alert Utilities
+        // -----------------------------------------------------------------
+        scrollMessagesToBottom() {
+          this.$nextTick(() => {
+            const el = this.$refs.messagesContainer;
+            if (el) el.scrollTop = el.scrollHeight;
+          });
+        },
+
+        stateLabel(state) {
+          if (state === "WAITING_FOR_HUMAN") return "WAITING FOR HUMAN";
+          if (state === "HUMAN_ACTIVE") return "HUMAN ACTIVE";
+          return "BOT ACTIVE";
+        },
+
+        stateBadgeClass(state) {
+          if (state === "WAITING_FOR_HUMAN") return "bg-amber-100 text-amber-800 border border-amber-300";
+          if (state === "HUMAN_ACTIVE") return "bg-emerald-100 text-emerald-800 border border-emerald-300";
+          return "bg-blue-100 text-blue-800 border border-blue-200";
+        },
+
+        senderDisplayName(msg) {
+          if (msg.sender === "user") return (this.selectedSession && this.selectedSession.visitor_name) || "Visitor";
+          if (msg.sender === "bot") return "AI Assistant";
+          return (msg.metadata && msg.metadata.agent_name) || "Human Agent";
+        },
+
+        formatShortTime(iso) {
+          if (!iso) return "";
+          try {
+            return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          } catch (_err) {
+            return "";
+          }
+        },
+
+        addToast(kind, title, message, sessionId = null) {
+          const id = ++this.toastSeq;
+          this.toasts.push({ id, kind, title, message, sessionId });
+          setTimeout(() => this.dismissToast(id), kind === "escalation" ? 12000 : 4500);
+        },
+
+        dismissToast(id) {
+          this.toasts = this.toasts.filter((t) => t.id !== id);
+        },
+
+        playAlertSound() {
+          if (!this.soundEnabled) return;
+          try {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) return;
+            if (!this.audioCtx || this.audioCtx.state === "closed") {
+              this.audioCtx = new AudioCtx();
+            }
+            const ctx = this.audioCtx;
+            if (ctx.state === "suspended") {
+              ctx.resume();
+            }
+            const playTone = (freq, start, dur) => {
+              const osc = ctx.createOscillator();
+              const gain = ctx.createGain();
+              osc.type = "sine";
+              osc.frequency.value = freq;
+              gain.gain.setValueAtTime(0.001, start);
+              gain.gain.exponentialRampToValueAtTime(0.14, start + 0.02);
+              gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
+              osc.connect(gain);
+              gain.connect(ctx.destination);
+              osc.start(start);
+              osc.stop(start + dur);
+            };
+            const now = ctx.currentTime;
+            playTone(660, now, 0.16);
+            playTone(880, now + 0.14, 0.22);
+          } catch (_err) {
+            // Audio autoplay policy may block until user interacts with page
+          }
+        },
+      };
+    }
+  </script>
+</body>
+</html>

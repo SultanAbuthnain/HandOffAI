@@ -1,0 +1,19 @@
+# Web framework & ASGI / WebSocket server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+websockets>=13.0
+python-multipart>=0.0.12
+python-dotenv>=1.0.1
+pydantic>=2.9.0
+
+# Lightweight local vector search (cosine similarity over float32 BLOBs in SQLite)
+numpy>=1.26.0
+
+# LLM & Embedding Providers (provider-agnostic wrapper supports both)
+openai>=1.55.0
+google-genai>=1.0.0
+
+# Automated Testing & Verification
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx>=0.27.0
